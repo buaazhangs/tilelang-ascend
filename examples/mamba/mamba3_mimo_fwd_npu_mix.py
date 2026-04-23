@@ -122,6 +122,8 @@ def mamba_mimo_fwd(
             k_shared = T.alloc_shared([fused_chunk_size, N], dtype)
             q_bias_frag = T.alloc_fragment([R, N], dtype)
             k_bias_frag = T.alloc_fragment([R, N], dtype)
+            q_bias_f32_frag = T.alloc_fragment([R, N], "float32")
+            k_bias_f32_frag = T.alloc_fragment([R, N], "float32")
 
             PsiV_shared = T.alloc_shared([fused_chunk_size, P], dtype)
             v_shared = T.alloc_shared([chunk_size, P], dtype)
@@ -162,10 +164,14 @@ def mamba_mimo_fwd(
             T.clear(states_frag)
 
             Psi_frag = T.alloc_fragment([R, P], dtype)
-            T.copy(MIMO_V[i_h, :, :], Psi_frag)
+            Psi_frag_f32 = T.alloc_fragment([R, P], "float32")
+            T.copy(MIMO_V[i_h, :, :], Psi_frag_f32)
+            T.vcast(Psi_frag_f32, Psi_frag, round_mode="rint")
 
-            T.copy(Q_BIAS[i_h, :, :], q_bias_frag)
-            T.copy(K_BIAS[i_h, :, :], k_bias_frag)
+            T.copy(Q_BIAS[i_h, :, :], q_bias_f32_frag)
+            T.vcast(q_bias_f32_frag, q_bias_frag, round_mode="rint")
+            T.copy(K_BIAS[i_h, :, :], k_bias_f32_frag)
+            T.vcast(k_bias_f32_frag, k_bias_frag, round_mode="rint")
 
             # --- Chunk Loop ---
             for i in T.Pipelined(0, nchunks, num_stages=mix_num_stages):
@@ -176,11 +182,15 @@ def mamba_mimo_fwd(
 
                 # --- Discretization Factors (Shifted Gamma + Trap Scale) ---
                 trap_shifted_frag = T.alloc_fragment([chunk_size], "float32")
-                T.copy(TRAP[i_b, i_h, chunk_start+1: chunk_start+chunk_size+1], trap_shifted_frag)
+                trap_shifted_bf16 = T.alloc_fragment([chunk_size], dtype)
+                T.copy(TRAP[i_b, i_h, chunk_start+1: chunk_start+chunk_size+1], trap_shifted_bf16)
+                T.vcast(trap_shifted_bf16, trap_shifted_frag, round_mode="rint")
                 T.vmul(trap_shifted_frag, -1, trap_shifted_frag)
                 T.vsigmoid(trap_shifted_frag, trap_shifted_frag)
                 dt_shifted_frag = T.alloc_fragment([chunk_size], dtype)
-                T.copy(DT[i_b, i_h, chunk_start+1: chunk_start+chunk_size+1], dt_shifted_frag)
+                dt_shifted_f32_frag = T.alloc_fragment([chunk_size], "float32")
+                T.copy(DT[i_b, i_h, chunk_start+1: chunk_start+chunk_size+1], dt_shifted_f32_frag)
+                T.vcast(dt_shifted_f32_frag, dt_shifted_frag, round_mode="rint")
                 shifted_gamma_frag = T.alloc_fragment([chunk_size], dtype)
                 T.clear(shifted_gamma_frag)
                 # for cs in T.Parallel(chunk_size):
@@ -195,10 +205,14 @@ def mamba_mimo_fwd(
                 T.copy(shifted_gamma_frag, shifted_gamma_shared)
 
                 trap_frag = T.alloc_fragment([chunk_size], "float32")
-                T.copy(TRAP[i_b, i_h, chunk_start: chunk_start+chunk_size], trap_frag)
+                trap_bf16 = T.alloc_fragment([chunk_size], dtype)
+                T.copy(TRAP[i_b, i_h, chunk_start: chunk_start+chunk_size], trap_bf16)
+                T.vcast(trap_bf16, trap_frag, round_mode="rint")
                 T.vsigmoid(trap_frag, trap_frag)
                 dt_frag = T.alloc_fragment([chunk_size], dtype)
-                T.copy(DT[i_b, i_h, chunk_start: chunk_start+chunk_size], dt_frag)
+                dt_f32_frag = T.alloc_fragment([chunk_size], "float32")
+                T.copy(DT[i_b, i_h, chunk_start: chunk_start+chunk_size], dt_f32_frag)
+                T.vcast(dt_f32_frag, dt_frag, round_mode="rint")
                 gamma_frag = T.alloc_fragment([chunk_size], "float32")
                 # 这里paraller还不支持
                 for cs in T.serial(chunk_size):
@@ -280,7 +294,9 @@ def mamba_mimo_fwd(
                     q_shared[cs*R + r, N//2 + n] = angles_frag_sin[cs, n] * q_first_half_frag[cs, r, n] + angles_frag_cos[cs, n] * q_second_half_frag[cs, r, n]
 
                 o_mimo_accum_frag = T.alloc_fragment([fused_chunk_size, P], dtype=accum_dtype)
-                T.copy(states_frag, states_accum_cast_shared)
+                states_frag_cast = T.alloc_fragment([N, P], dtype)
+                T.vcast(states_frag, states_frag_cast, round_mode="rint")
+                T.copy(states_frag_cast, states_accum_cast_shared)
                 T.gemm(q_shared, states_accum_cast_shared, o_mimo_accum_frag, initC=True)
                 # 这部分是 inter-chunk 的 q @ state，先落到 workspace，后续 vector 再乘 exp(DA_CS)。
                 T.copy(o_mimo_accum_frag, o_inter_ws[0, 0, 0], size=[fused_chunk_size, P])
