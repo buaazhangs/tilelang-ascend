@@ -697,7 +697,8 @@ def ref_forward(
 def run_test():
     os.environ["TILELANG_ASCEND_MODE"] = "Dev"
 
-    B, S, H, G, N, P, R = 1, 16, 4, 4, 32, 64, 2
+    # 和 mix 测试对齐到多 chunk 场景，便于比较两条编译路径的行为。
+    B, S, H, G, N, P, R = 1, 32, 4, 4, 32, 64, 2
     chunk_size         = 16
     rotary_dim_divisor = 4
     hasZ               = True

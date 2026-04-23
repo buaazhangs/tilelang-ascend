@@ -711,7 +711,9 @@ def run_test():
     os.environ["TILELANG_ASCEND_MODE"] = "Expert"
     os.environ["TILELANG_ASCEND_WORKSPACE_SIZE"] = str(1024 * 1024 * 512)
 
-    B, S, H, G, N, P, R = 1, 16, 4, 4, 32, 64, 2
+    # 这里把 S 调到大于 chunk_size，确保 nchunks > 1，
+    # 这样 Expert/mix 路径里的 pipeline loop 不会在前面被直接折叠掉。
+    B, S, H, G, N, P, R = 1, 32, 4, 4, 32, 64, 2
     chunk_size         = 16
     rotary_dim_divisor = 4
     hasZ               = True
