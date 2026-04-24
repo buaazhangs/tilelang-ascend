@@ -160,6 +160,11 @@ def mamba_mimo_fwd(
             T.use_swizzle(10, "row")
 
             # --- Per-Head Constants / Running State ---
+            # 阶段 0：Head 级初始化。
+            # 这部分主要准备常驻参数和递归状态：
+            # - states_frag: [N, P]
+            # - Psi_frag:    [R, P]
+            # - q/k bias:    [R, N]
             states_frag = T.alloc_fragment([N, P], accum_dtype)
             T.clear(states_frag)
 
@@ -180,7 +185,12 @@ def mamba_mimo_fwd(
                 segsum = T.alloc_fragment([chunk_size, chunk_size], "float32")
                 T.copy(SEGSUM[i_b, i_h, i, :, :], segsum)
 
-                # --- Discretization Factors (Shifted Gamma + Trap Scale) ---
+                # ==================== 阶段 1：Vector 预处理 ====================
+                # 从 GM 读取 DT / TRAP / SEGSUM，并做逐元素计算，得到：
+                # - shifted_gamma_frag: [chunk_size]
+                # - gamma_frag:         [chunk_size]
+                # - trap_scale_shared:  [chunk_size]
+                # 这些量后面会参与 K 缩放和对角项修正。
                 trap_shifted_frag = T.alloc_fragment([chunk_size], "float32")
                 trap_shifted_bf16 = T.alloc_fragment([chunk_size], dtype)
                 T.copy(TRAP[i_b, i_h, chunk_start+1: chunk_start+chunk_size+1], trap_shifted_bf16)
@@ -223,7 +233,12 @@ def mamba_mimo_fwd(
                 trap_scale_shared = T.alloc_shared([chunk_size], dtype)
                 T.copy(trap_scale_frag, trap_scale_shared)
 
-                # --- Up-Project V and Prepare Biased Q/K ---
+                # ==================== 阶段 2：Vector/搬运预处理 ====================
+                # 从 GM 读取当前 chunk 的 V / Q / K，并为后续 GEMM 准备输入：
+                # - v_shared:    [chunk_size, P]
+                # - PsiV_shared: [chunk_size * R, P]
+                # - q_shared:    [chunk_size * R, N]
+                # - k_shared:    [chunk_size * R, N]
                 PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
                 for cs, p in T.Parallel(chunk_size, P):
                     v_shared[cs, p] = V[i_b, chunk_start+cs, i_h, p]
@@ -253,6 +268,12 @@ def mamba_mimo_fwd(
                 # --- Cache Diagonal qk_dot Path ---
                 # 这是第一段 cube 计算：
                 # 先把每个 chunk 内同一步的 qk dot 算出来，后面 vector 侧要复用这块对角贡献。
+                # ==================== 阶段 3：Cube ====================
+                # q_shared @ k_shared^T
+                # - 输入 q_shared: [chunk_size * R, N]
+                # - 输入 k_shared: [chunk_size * R, N]
+                # - 输出 qk_dot_ws: [chunk_size * R, chunk_size * R]
+                # 这一路是对角项所需的 qk dot，先落到 workspace。
                 qk_dot_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
                 T.gemm(q_shared, k_shared, qk_dot_frag, b_transpose=True, initC=True)
                 T.copy(qk_dot_frag, qk_dot_ws[0, 0, 0], size=[fused_chunk_size, fused_chunk_size])
@@ -273,7 +294,12 @@ def mamba_mimo_fwd(
                 # T.reduce_sum(qk_predot_frag, qk_dot_frag, dim=-1, clear=True)
                 # T.copy(T.view(qk_dot_frag, shape=[fused_chunk_size, R]), qk_dot_shared)
 
-                # --- Rotary Q + Interchunk Contribution ---
+                # ==================== 阶段 4：Vector 预处理 + Cube ====================
+                # 先对 Q 做 rotary，再执行 q @ state：
+                # - q_shared(rotary后):       [chunk_size * R, N]
+                # - states_accum_cast_shared: [N, P]
+                # - o_inter_ws:               [chunk_size * R, P]
+                # 这是 inter-chunk 路径，结果先写到 workspace。
                 q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
                 q_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
 
@@ -301,7 +327,10 @@ def mamba_mimo_fwd(
                 # 这部分是 inter-chunk 的 q @ state，先落到 workspace，后续 vector 再乘 exp(DA_CS)。
                 T.copy(o_mimo_accum_frag, o_inter_ws[0, 0, 0], size=[fused_chunk_size, P])
 
-                # --- Rotary K + Trap Scaling + Intrachunk Contribution ---
+                # ==================== 阶段 5：Vector 预处理 ====================
+                # 对 K 做 rotary，并乘 trap_scale：
+                # - 输入/输出 k_shared: [chunk_size * R, N]
+                # 这是后续 intrachunk GEMM 的 K 输入准备阶段。
                 k_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
                 k_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
 
@@ -332,6 +361,12 @@ def mamba_mimo_fwd(
                 T.vcast(k_trap_scaled_frag_f32, k_trap_scaled_frag)
                 T.copy(k_trap_scaled_frag, k_shared)
 
+                # ==================== 阶段 6：Cube ====================
+                # q_shared @ k_shared^T（这里的 k_shared 已经做完 rotary + trap_scale）
+                # - 输入 q_shared:         [chunk_size * R, N]
+                # - 输入 k_shared:         [chunk_size * R, N]
+                # - 输出 qk_intrachunk_ws: [chunk_size * R, chunk_size * R]
+                # 这一路是 chunk 内相关性主干，结果先写到 workspace。
                 qk_intrachunk_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
                 T.gemm(q_shared, k_shared, qk_intrachunk_frag, b_transpose=True, initC=True)
                 # 这是第二段 cube 计算：chunk 内严格因果部分的原始 qk 结果。
@@ -341,6 +376,12 @@ def mamba_mimo_fwd(
                 # 1. 按 vid 拆分当前 chunk 的若干 step。
                 # 2. 做严格因果 mask。
                 # 3. 对 inter-chunk 部分乘 exp(DA_CS) 衰减。
+                # ==================== 阶段 7：Vector ====================
+                # 按 vid 分片处理当前 chunk 的一部分行：
+                # - qk_intrachunk_vec: [block_vid * R, chunk_size * R]
+                # - o_inter_vec:       [block_vid * R, P]
+                # - da_cs_vec:         [block_vid]
+                # 完成严格因果 mask、乘 exp(SEGSUM)、乘 exp(DA_CS)，再写回 workspace。
                 T.vexp(segsum, segsum)
                 if vid * block_vid < chunk_size:
                     vec_chunk_start = vid * block_vid
@@ -394,6 +435,12 @@ def mamba_mimo_fwd(
                         size=[vec_rows * R, P],
                     )
 
+                # ==================== 阶段 8：Cube ====================
+                # qk_masked @ PsiV
+                # - 输入 qk_masked: [chunk_size * R, chunk_size * R]
+                # - 输入 PsiV:      [chunk_size * R, P]
+                # - 输出 o_intra_ws:[chunk_size * R, P]
+                # 这是 intrachunk 的主贡献路径，结果写回 workspace。
                 T.copy(qk_masked_ws[0, 0, 0], qk_intrachunk_shared, size=[fused_chunk_size, fused_chunk_size])
                 tmp = T.alloc_fragment([fused_chunk_size, P], dtype=accum_dtype)
                 T.gemm(qk_intrachunk_shared, PsiV_shared, tmp, initC=True)
@@ -405,6 +452,12 @@ def mamba_mimo_fwd(
                 # 2. 可选加入 D 支路。
                 # 3. 做 Z gate。
                 # 4. reduceO 时再乘 MIMO_O 并沿 R 归约，最终写回 O。
+                # ==================== 阶段 9：Vector ====================
+                # 从 workspace 读回三条主路径并在 vector 侧完成最终收敛：
+                # - o_inter_ws -> o_inter_vec: [block_vid * R, P]
+                # - o_intra_ws -> o_intra_vec: [block_vid * R, P]
+                # - qk_dot_ws  -> qk_dot_vec:  [block_vid * R, chunk_size * R]
+                # 然后合并 inter / intra / diagonal，可选叠加 D 和 Z，最后写回 O。
                 if vid * block_vid < chunk_size:
                     vec_chunk_start = vid * block_vid
                     vec_rows = T.min(block_vid, chunk_size - vec_chunk_start)
