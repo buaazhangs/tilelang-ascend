@@ -191,6 +191,28 @@ def mamba_mimo_fwd(
             o_intra_ws = T.alloc_workspace(
                 (2, fused_chunk_size, P), accum_dtype, multi_buffer=mix_num_stages
             )
+            # mix 模式约束：GEMM 的 shared/L1 输入不能直接来自 vector 结果。
+            # 下面这些 workspace 用作显式 GM 中转：
+            # - vector 预处理结果先写 workspace，再由 cube 阶段 copy 到 shared/L1。
+            # - cube 输出先写 workspace，再由 vector 阶段按 vid 分片读回 UB。
+            q_biased_ws = T.alloc_workspace(
+                (2, fused_chunk_size, N), dtype, multi_buffer=mix_num_stages
+            )
+            k_biased_ws = T.alloc_workspace(
+                (2, fused_chunk_size, N), dtype, multi_buffer=mix_num_stages
+            )
+            q_rot_ws = T.alloc_workspace(
+                (2, fused_chunk_size, N), dtype, multi_buffer=mix_num_stages
+            )
+            k_scaled_ws = T.alloc_workspace(
+                (2, fused_chunk_size, N), dtype, multi_buffer=mix_num_stages
+            )
+            states_cast_ws = T.alloc_workspace(
+                (2, N, P), dtype, multi_buffer=mix_num_stages
+            )
+            psiv_ws = T.alloc_workspace(
+                (2, fused_chunk_size, P), dtype, multi_buffer=mix_num_stages
+            )
 
             # --- Swizzling Annotation ---
             T.annotate_layout({
@@ -297,7 +319,8 @@ def mamba_mimo_fwd(
                     PsiV_frag[cs, r, p] = v_shared[cs, p] * Psi_frag[r, p]
                 PsiV_reshaped_frag = T.alloc_fragment([fused_chunk_size, P], dtype)
                 T.reshape(PsiV_frag, PsiV_reshaped_frag)
-                T.copy(PsiV_reshaped_frag, PsiV_shared)
+                # vector 生成的 PsiV 不能直接作为后续 GEMM 的 L1 输入，先落 workspace。
+                T.copy(PsiV_reshaped_frag, psiv_ws[0, 0, 0], size=[fused_chunk_size, P])
 
 
                 #V3
@@ -305,7 +328,10 @@ def mamba_mimo_fwd(
                 T.copy(Q[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], q_frag)
                 for cs, r, n in T.Parallel(chunk_size, R, N):
                     q_frag[cs, r, n] += q_bias_frag[r, n]
-                T.reshape(q_frag, q_shared)
+                q_biased_flat = T.alloc_fragment([fused_chunk_size, N], dtype)
+                T.reshape(q_frag, q_biased_flat)
+                # Q+bias 是 vector 结果，后续 cube 使用前必须经过 workspace。
+                T.copy(q_biased_flat, q_biased_ws[0, 0, 0], size=[fused_chunk_size, N])
 
                 
 
@@ -313,7 +339,10 @@ def mamba_mimo_fwd(
                 T.copy(K[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], k_frag)
                 for cs, r, n in T.Parallel(chunk_size, R, N):
                     k_frag[cs, r, n] += k_bias_frag[r, n]
-                T.reshape(k_frag, k_shared)
+                k_biased_flat = T.alloc_fragment([fused_chunk_size, N], dtype)
+                T.reshape(k_frag, k_biased_flat)
+                # K+bias 同样先落 workspace，避免 vector 结果直接喂 GEMM 输入。
+                T.copy(k_biased_flat, k_biased_ws[0, 0, 0], size=[fused_chunk_size, N])
 
 
                 # --- Cache Diagonal qk_dot Path ---
@@ -327,6 +356,9 @@ def mamba_mimo_fwd(
                 # 这一路是对角项所需的 qk dot，先落到 workspace。
                 qk_dot_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
                 #c1
+                # cube 输入从 workspace 回灌到 shared/L1，符合 GM->L1->GEMM 的 mix 约束。
+                T.copy(q_biased_ws[0, 0, 0], q_shared, size=[fused_chunk_size, N])
+                T.copy(k_biased_ws[0, 0, 0], k_shared, size=[fused_chunk_size, N])
                 T.gemm(q_shared, k_shared, qk_dot_frag, b_transpose=True, initC=True)
                 T.copy(qk_dot_frag, qk_dot_ws[0, 0, 0], size=[fused_chunk_size, fused_chunk_size])
                 #c1 end
@@ -353,12 +385,14 @@ def mamba_mimo_fwd(
                 # - states_accum_cast_shared: [N, P]
                 # - o_inter_ws:               [chunk_size * R, P]
                 # 这是 inter-chunk 路径，结果先写到 workspace。
+                q_rot_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
+                T.copy(q_biased_ws[0, 0, 0], q_rot_frag, size=[fused_chunk_size, N])
                 q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
                 q_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
 
                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
-                    q_first_half_frag[cs, r, n] = q_shared[cs*R + r, n]
-                    q_second_half_frag[cs, r, n] = q_shared[cs*R + r, N//2 + n]
+                    q_first_half_frag[cs, r, n] = q_rot_frag[cs*R + r, n]
+                    q_second_half_frag[cs, r, n] = q_rot_frag[cs*R + r, N//2 + n]
 
                 # NOTE: angles are casted to fp32 for numerical stability
                 angles_frag = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], "float32")
@@ -369,13 +403,18 @@ def mamba_mimo_fwd(
                 T.vsin(angles_frag, angles_frag_sin)
 
                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
-                    q_shared[cs*R + r, n] = angles_frag_cos[cs, n] * q_first_half_frag[cs, r, n] - angles_frag_sin[cs, n] * q_second_half_frag[cs, r, n]
-                    q_shared[cs*R + r, N//2 + n] = angles_frag_sin[cs, n] * q_first_half_frag[cs, r, n] + angles_frag_cos[cs, n] * q_second_half_frag[cs, r, n]
+                    q_rot_frag[cs*R + r, n] = angles_frag_cos[cs, n] * q_first_half_frag[cs, r, n] - angles_frag_sin[cs, n] * q_second_half_frag[cs, r, n]
+                    q_rot_frag[cs*R + r, N//2 + n] = angles_frag_sin[cs, n] * q_first_half_frag[cs, r, n] + angles_frag_cos[cs, n] * q_second_half_frag[cs, r, n]
+                # rotary 后的 Q 是 vector 结果，先写 workspace，后续 q@state / q@k 再读回 shared。
+                T.copy(q_rot_frag, q_rot_ws[0, 0, 0], size=[fused_chunk_size, N])
 
                 o_mimo_accum_frag = T.alloc_fragment([fused_chunk_size, P], dtype=accum_dtype)
                 states_frag_cast = T.alloc_fragment([N, P], dtype)
                 T.vcast(states_frag, states_frag_cast, round_mode="rint")
-                T.copy(states_frag_cast, states_accum_cast_shared)
+                # state cast 结果也通过 workspace 中转，避免直接 copy 到 GEMM 的 L1 输入。
+                T.copy(states_frag_cast, states_cast_ws[0, 0, 0], size=[N, P])
+                T.copy(q_rot_ws[0, 0, 0], q_shared, size=[fused_chunk_size, N])
+                T.copy(states_cast_ws[0, 0, 0], states_accum_cast_shared, size=[N, P])
                 T.gemm(q_shared, states_accum_cast_shared, o_mimo_accum_frag, initC=True)
                 # 这部分是 inter-chunk 的 q @ state，先落到 workspace，后续 vector 再乘 exp(DA_CS)。
                 T.copy(o_mimo_accum_frag, o_inter_ws[0, 0, 0], size=[fused_chunk_size, P])
@@ -384,16 +423,18 @@ def mamba_mimo_fwd(
                 # 对 K 做 rotary，并乘 trap_scale：
                 # - 输入/输出 k_shared: [chunk_size * R, N]
                 # 这是后续 intrachunk GEMM 的 K 输入准备阶段。
+                k_rot_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
+                T.copy(k_biased_ws[0, 0, 0], k_rot_frag, size=[fused_chunk_size, N])
                 k_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
                 k_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
 
                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
-                    k_first_half_frag[cs, r, n] = k_shared[cs*R + r, n]
-                    k_second_half_frag[cs, r, n] = k_shared[cs*R + r, N//2 + n]
+                    k_first_half_frag[cs, r, n] = k_rot_frag[cs*R + r, n]
+                    k_second_half_frag[cs, r, n] = k_rot_frag[cs*R + r, N//2 + n]
                 
                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
-                    k_shared[cs*R + r, n] = angles_frag_cos[cs, n] * k_first_half_frag[cs, r, n] - angles_frag_sin[cs, n] * k_second_half_frag[cs, r, n]
-                    k_shared[cs*R + r, N//2 + n] = angles_frag_sin[cs, n] * k_first_half_frag[cs, r, n] + angles_frag_cos[cs, n] * k_second_half_frag[cs, r, n]
+                    k_rot_frag[cs*R + r, n] = angles_frag_cos[cs, n] * k_first_half_frag[cs, r, n] - angles_frag_sin[cs, n] * k_second_half_frag[cs, r, n]
+                    k_rot_frag[cs*R + r, N//2 + n] = angles_frag_sin[cs, n] * k_first_half_frag[cs, r, n] + angles_frag_cos[cs, n] * k_second_half_frag[cs, r, n]
 
                 # FINAL_K 链路先停用，当前 mix 文件只聚焦 O 的正确性。
                 # if i == nchunks - 1 and return_final_state:
@@ -403,7 +444,7 @@ def mamba_mimo_fwd(
                 #             T.copy(k_shared[csr, n], FINAL_K[i_b, csr % R, i_h, n], size=[1,1])
 
                 k_trap_scaled_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
-                T.copy(k_shared, k_trap_scaled_frag)
+                T.copy(k_rot_frag, k_trap_scaled_frag)
                 # for csr, n in T.Parallel(fused_chunk_size, N):
                 #     k_trap_scaled_frag[csr, n] *= trap_scale_shared[csr//R]
                 k_trap_scaled_frag_f32 = T.alloc_fragment([fused_chunk_size, N], "float32")
@@ -412,7 +453,8 @@ def mamba_mimo_fwd(
                     for n in T.serial(N):
                         k_trap_scaled_frag_f32[csr, n] *= trap_scale_shared[csr//R]
                 T.vcast(k_trap_scaled_frag_f32, k_trap_scaled_frag)
-                T.copy(k_trap_scaled_frag, k_shared)
+                # rotary + trap_scale 后的 K 是 vector 结果，先落 workspace，后续 cube 再读入 shared。
+                T.copy(k_trap_scaled_frag, k_scaled_ws[0, 0, 0], size=[fused_chunk_size, N])
 
                 # ==================== 阶段 6：Cube ====================
                 # q_shared @ k_shared^T（这里的 k_shared 已经做完 rotary + trap_scale）
@@ -421,6 +463,9 @@ def mamba_mimo_fwd(
                 # - 输出 qk_intrachunk_ws: [chunk_size * R, chunk_size * R]
                 # 这一路是 chunk 内相关性主干，结果先写到 workspace。
                 qk_intrachunk_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
+                # 第二段 cube 同样只从 workspace 准备 GEMM 输入。
+                T.copy(q_rot_ws[0, 0, 0], q_shared, size=[fused_chunk_size, N])
+                T.copy(k_scaled_ws[0, 0, 0], k_shared, size=[fused_chunk_size, N])
                 T.gemm(q_shared, k_shared, qk_intrachunk_frag, b_transpose=True, initC=True)
                 # 这是第二段 cube 计算：chunk 内严格因果部分的原始 qk 结果。
                 T.copy(qk_intrachunk_frag, qk_intrachunk_ws[0, 0, 0], size=[fused_chunk_size, fused_chunk_size])
@@ -494,7 +539,9 @@ def mamba_mimo_fwd(
                 # - 输入 PsiV:      [chunk_size * R, P]
                 # - 输出 o_intra_ws:[chunk_size * R, P]
                 # 这是 intrachunk 的主贡献路径，结果写回 workspace。
+                # masked qk 与 PsiV 均从 workspace 读回 shared，避免 vector/shared 结果直接跨到 cube。
                 T.copy(qk_masked_ws[0, 0, 0], qk_intrachunk_shared, size=[fused_chunk_size, fused_chunk_size])
+                T.copy(psiv_ws[0, 0, 0], PsiV_shared, size=[fused_chunk_size, P])
                 tmp = T.alloc_fragment([fused_chunk_size, P], dtype=accum_dtype)
                 T.gemm(qk_intrachunk_shared, PsiV_shared, tmp, initC=True)
                 # 这是第三段 cube 计算：masked qk 与 PsiV 相乘，得到 intra-chunk 输出贡献。
@@ -519,11 +566,13 @@ def mamba_mimo_fwd(
                     o_inter_vec = T.alloc_shared([block_vid * R, P], accum_dtype)
                     o_intra_vec = T.alloc_shared([block_vid * R, P], accum_dtype)
                     qk_dot_vec = T.alloc_shared([block_vid * R, fused_chunk_size], accum_dtype)
+                    psiv_vec = T.alloc_shared([fused_chunk_size, P], dtype)
                     z_vec = T.alloc_shared([block_vid, P], dtype)
 
                     T.copy(o_inter_ws[0, vec_row_offset, 0], o_inter_vec, size=[vec_rows * R, P])
                     T.copy(o_intra_ws[0, vec_row_offset, 0], o_intra_vec, size=[vec_rows * R, P])
                     T.copy(qk_dot_ws[0, vec_row_offset, 0], qk_dot_vec, size=[vec_rows * R, fused_chunk_size])
+                    T.copy(psiv_ws[0, 0, 0], psiv_vec, size=[fused_chunk_size, P])
                     if hasZ:
                         T.copy(Z[i_b, chunk_start + vec_chunk_start, i_h, 0], z_vec, size=[vec_rows, P])
 
@@ -537,11 +586,11 @@ def mamba_mimo_fwd(
                                 for r_in in T.serial(R):
                                     diag_acc += (
                                         qk_dot_vec[local_csr, global_cs * R + r_in]
-                                        * PsiV_shared[global_cs * R + r_in, p]
+                                        * psiv_vec[global_cs * R + r_in, p]
                                     )
                                 diag_acc *= gamma_frag[global_cs]
                                 if hasD:
-                                    diag_acc += D[i_h] * PsiV_shared[global_cs * R + global_r, p]
+                                    diag_acc += D[i_h] * psiv_vec[global_cs * R + global_r, p]
                                 o_inter_vec[local_csr, p] += diag_acc
 
                     if reduceO:
