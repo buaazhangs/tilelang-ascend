@@ -153,11 +153,11 @@ private:
   }
 
   bool visitGroupOfOps(Operation *op,
-                       llvm::function_ref<bool(const Operation *)> visitor) {
-    const Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
+                       llvm::function_ref<bool(Operation *)> visitor) {
+    Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
     if (!scopeUnit)
       return false;
-    if (touchesMarkedLocalBoundary(const_cast<Operation *>(scopeUnit)))
+    if (touchesMarkedLocalBoundary(scopeUnit))
       return false;
     if (visitor(scopeUnit))
       return true;
@@ -184,9 +184,9 @@ private:
     return false;
   }
 
-  const Operation *getTopLevelOpInCurrentFor(const Operation *op) const {
+  Operation *getTopLevelOpInCurrentFor(Operation *op) {
     auto *body = currentForOp.getBody();
-    const Operation *cur = op;
+    Operation *cur = op;
     while (cur && cur->getBlock() != body)
       cur = cur->getParentOp();
     return cur;
