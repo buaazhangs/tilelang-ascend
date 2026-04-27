@@ -154,9 +154,12 @@ private:
 
   bool visitGroupOfOps(Operation *op,
                        llvm::function_ref<bool(const Operation *)> visitor) {
-    if (touchesMarkedLocalBoundary(op))
+    const Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
+    if (!scopeUnit)
       return false;
-    if (visitor(op))
+    if (touchesMarkedLocalBoundary(const_cast<Operation *>(scopeUnit)))
+      return false;
+    if (visitor(scopeUnit))
       return true;
     LDBG("Visiting " << *op);
 
@@ -179,6 +182,14 @@ private:
     }
 
     return false;
+  }
+
+  const Operation *getTopLevelOpInCurrentFor(const Operation *op) const {
+    auto *body = currentForOp.getBody();
+    const Operation *cur = op;
+    while (cur && cur->getBlock() != body)
+      cur = cur->getParentOp();
+    return cur;
   }
 
   bool isValFromWorkspace(Value val) {

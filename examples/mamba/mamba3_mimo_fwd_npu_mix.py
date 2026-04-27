@@ -46,14 +46,32 @@ def mamba_mimo_fwd(
     num_stages: int = 0,
 ) -> torch.Tensor:
 
+    # 维度约定：
+    # - B: batch size，样本数。
+    # - S: sequence length，序列长度，也就是 token / step 数。
+    # - H: 输出侧 head 数，V/O/Z/D/MIMO_* 都按 H 组织。
+    # - G: Q/K 的 group 数，用于 GQA 风格的 head 到 group 映射。
+    # - N: state 维度，也是 Q/K 最后一维和 state 矩阵的行维。
+    # - P: value/output 维度，也是 O、V、Psi/Phi/Zeta 的通道维。
+    # - R: MIMO 分量数。每个 step 会展开成 R 个子通路，GEMM 前常展平成 chunk_size * R。
+    # 其他参数：
+    # - chunk_size: 每个 AICore 一次流水处理的序列块长度。
+    # - rotary_dim_divisor: 控制 rotary 使用的 N 维子空间大小。
+    # - num_stages: 显式传入时控制 workspace multi-buffer 级数；默认走 2 级乒乓缓冲。
     accum_dtype = 'float32'
     # mix 模式至少需要 2 个 stage，这样 workspace 才能被扩成乒乓缓冲。
+    # mix_num_stages 是核间/阶段间 workspace multi-buffer 的级数。
+    # 当前 run_test 未显式传 num_stages，因此默认会取 2，即乒乓缓冲。
     mix_num_stages = num_stages if num_stages and num_stages > 1 else 2
 
     nchunks = tilelang.cdiv(S, chunk_size)
     tail_len = S % chunk_size
+    # fused_chunk_size = chunk_size * R。
+    # 本 kernel 会把一个 chunk 内的 [chunk_size, R, ...] 展平成 [chunk_size * R, ...] 来做 GEMM。
     fused_chunk_size = chunk_size * R
     # vid 负责按 chunk 内的 step 维度切分 vector 侧工作。
+    # block_vid 是一个 vector 子核一次负责的 step 数。
+    # 当前 chunk_size=16 时 block_vid=8，因此 vid=0/1 分别覆盖一个 chunk 的前/后 8 个 step。
     block_vid = (chunk_size + 1) // 2
 
     if reduceO:
@@ -92,6 +110,26 @@ def mamba_mimo_fwd(
             then writes output activations.
 
         Inputs:
+            入参中文说明：
+            - Q: query 输入，[B, S, R, G, N]。当前 (B,H) 逻辑核会把 H 映射到一个 Q/K group G。
+            - K: key 输入，[B, S, R, G, N]。参与 q@k^T 和 state update 路径。
+            - V: value 输入，[B, S, H, P]。会和 MIMO_V/Psi 结合生成 PsiV。
+            - O: 主输出。reduceO=True 时为 [B, S, H, P]；否则为 [B, S, R, H, P]。
+            - Q_BIAS: 每个 head 和 MIMO 分量的 Q 偏置，[H, R, N]。
+            - K_BIAS: 每个 head 和 MIMO 分量的 K 偏置，[H, R, N]。
+            - MIMO_V: Psi 投影参数，[H, R, P]，把 V 展开到 R 个 MIMO 分量。
+            - MIMO_O: Phi 输出投影参数，[H, R, P]，沿 R 归约前使用。
+            - Z: 可选 gate 输入，[B, S, H, P]。
+            - D: 可选 diagonal 直连修正，每个 head 一个标量，[H]。
+            - MIMO_Z: Zeta gate 投影参数，[H, R, P]。
+            - ANGLES: rotary 位置角度，[B, S, H, N // rotary_dim_divisor]。
+            - DA_CS: forward decay 系数，[B, H, S]，用于 inter-chunk 衰减。
+            - DA_CS_REV: state update 方向 decay 系数，[B, H, S]；当前 FINAL_STATE 链路停用。
+            - DT: 离散化步长参数，[B, H, S + 1]。
+            - TRAP: trapezoidal 调制参数，[B, H, S + 1]。
+            - SEGSUM: chunk 内因果衰减矩阵，[B, H, nchunks, chunk_size, chunk_size]。
+            - FINAL_STATE: 最终递归状态输出，[B, H, N, P]；当前 mix 文件停用。
+            - FINAL_K: decode 辅助输出，[B, R, H, N]；当前 mix 文件停用。
             - Activations: Q, K, V.
             - Projection parameters/biases: MIMO_V (Psi), MIMO_O (Phi), optional MIMO_Z (Zeta), ANGLES,
               and Q_BIAS/K_BIAS.
@@ -110,6 +148,12 @@ def mamba_mimo_fwd(
             - Trap: convex-combination modulator used in exponential-trapezoidal discretization.
         """
         
+        # 逻辑核划分：
+        # - T.Kernel(B * H, is_npu=True) 表示沿 batch/head 二维展开逻辑核。
+        # - cid 的取值范围是 [0, B * H)，这里把 cid 映射为 (i_b, i_h)。
+        # - 每个逻辑核负责一个 batch 上的一个输出 head，即完整处理 O[i_b, :, i_h, :]。
+        # - vid 是同一个逻辑核内的 vector 子核 id，用来在 vector 阶段切分 chunk 内的 step 行。
+        #   例如 chunk_size=16、block_vid=8 时，vid=0/1 分别处理前/后 8 个 step。
         with T.Kernel(B * H, is_npu=True) as (cid, vid):
             # --- Kernel Setup ---
             i_b = cid // H
@@ -165,6 +209,7 @@ def mamba_mimo_fwd(
             # - states_frag: [N, P]
             # - Psi_frag:    [R, P]
             # - q/k bias:    [R, N]
+            # V0
             states_frag = T.alloc_fragment([N, P], accum_dtype)
             T.clear(states_frag)
 
@@ -177,17 +222,20 @@ def mamba_mimo_fwd(
             T.vcast(q_bias_f32_frag, q_bias_frag, round_mode="rint")
             T.copy(K_BIAS[i_h, :, :], k_bias_f32_frag)
             T.vcast(k_bias_f32_frag, k_bias_frag, round_mode="rint")
-
             # --- Chunk Loop ---
+            # 单个 AICore 的主处理循环：
+            # - 序列 S 被切成 nchunks 个 chunk，每个 chunk 长度为 chunk_size。
+            # - 当前逻辑核固定处理一个 (i_b, i_h)，沿 i 遍历该 head 的所有 chunk。
+            # - T.Pipelined 会给这个 chunk 循环打上流水语义，后续 mix pass 会围绕它做 scope 划分、
+            #   workspace multi-buffer、cube/vector 同步和分核。
+            # - num_stages=mix_num_stages 表示流水缓冲级数；默认是 2 级乒乓缓冲。
+            # - 每轮循环内部按阶段执行：vector 预处理 -> cube GEMM -> workspace -> vector -> cube -> vector 写 O。
             for i in T.Pipelined(0, nchunks, num_stages=mix_num_stages):
-
-                # vec1
-                
+                # V1
                 chunk_start = i * chunk_size
-
+                # V2
                 segsum = T.alloc_fragment([chunk_size, chunk_size], "float32")
                 T.copy(SEGSUM[i_b, i_h, i, :, :], segsum)
-
                 # ==================== 阶段 1：Vector 预处理 ====================
                 # 从 GM 读取 DT / TRAP / SEGSUM，并做逐元素计算，得到：
                 # - shifted_gamma_frag: [chunk_size]
@@ -252,7 +300,7 @@ def mamba_mimo_fwd(
                 T.copy(PsiV_reshaped_frag, PsiV_shared)
 
 
-
+                #V3
                 q_frag = T.alloc_fragment([chunk_size, R, N], dtype)
                 T.copy(Q[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], q_frag)
                 for cs, r, n in T.Parallel(chunk_size, R, N):
@@ -278,8 +326,10 @@ def mamba_mimo_fwd(
                 # - 输出 qk_dot_ws: [chunk_size * R, chunk_size * R]
                 # 这一路是对角项所需的 qk dot，先落到 workspace。
                 qk_dot_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
+                #c1
                 T.gemm(q_shared, k_shared, qk_dot_frag, b_transpose=True, initC=True)
                 T.copy(qk_dot_frag, qk_dot_ws[0, 0, 0], size=[fused_chunk_size, fused_chunk_size])
+                #c1 end
                 # Option B: extremely slow
                 # qk_dot_frag = T.alloc_fragment([chunk_size, R, R], dtype=accum_dtype)
                 # T.clear(qk_dot_frag)
