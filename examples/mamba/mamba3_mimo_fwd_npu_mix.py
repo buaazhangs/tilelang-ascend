@@ -180,6 +180,9 @@ def mamba_mimo_fwd(
 
             # --- Chunk Loop ---
             for i in T.Pipelined(0, nchunks, num_stages=mix_num_stages):
+
+                # vec1
+                
                 chunk_start = i * chunk_size
 
                 segsum = T.alloc_fragment([chunk_size, chunk_size], "float32")
