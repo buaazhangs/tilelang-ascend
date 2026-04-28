@@ -23,6 +23,7 @@
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 
 namespace mlir::tilelangir {
 
@@ -55,13 +56,16 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
           if (!isValFromWorkspace(val))
             continue;
           LDBG("Start from " << *copyOp.getOperation());
-          if (visitGroupOfOps(copyOp, [&](const Operation *op) {
-                if (opGroupId.find(op) == opGroupId.end()) {
+          llvm::SmallPtrSet<Operation *, 32> visited;
+          if (visitGroupOfOps(copyOp, [&](Operation *op) {
+                auto it = opGroupId.find(op);
+                if (it == opGroupId.end()) {
                   opGroupId[op] = groupId;
                   return false;
                 }
-                return true;
-              }))
+                return it->second != groupId;
+              },
+                              visited))
             break;
           groupId++;
           break;
@@ -153,9 +157,12 @@ private:
   }
 
   bool visitGroupOfOps(Operation *op,
-                       llvm::function_ref<bool(Operation *)> visitor) {
+                       llvm::function_ref<bool(Operation *)> visitor,
+                       llvm::SmallPtrSetImpl<Operation *> &visited) {
     Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
     if (!scopeUnit)
+      return false;
+    if (!visited.insert(scopeUnit).second)
       return false;
     if (touchesMarkedLocalBoundary(scopeUnit))
       return false;
@@ -168,7 +175,8 @@ private:
         continue;
       if (isa<scf::YieldOp>(user))
         continue;
-      visitGroupOfOps(user, visitor);
+      if (visitGroupOfOps(user, visitor, visited))
+        return true;
     }
 
     for (auto operand : op->getOperands()) {
@@ -178,7 +186,8 @@ private:
       if (isScalarOp(definingOp) ||
           isa<bishengir::memref_ext::AllocWorkspaceOp>(definingOp))
         continue;
-      visitGroupOfOps(definingOp, visitor);
+      if (visitGroupOfOps(definingOp, visitor, visited))
+        return true;
     }
 
     return false;
