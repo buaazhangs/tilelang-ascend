@@ -1,4 +1,4 @@
-2026-04-28 16:34:25  [TileLang:tilelang.env:WARNING]: Loading tilelang libs from dev root: /home/z00910011/tilelang-ascend-test/tilelang-ascend/build
+2026-04-28 19:29:28  [TileLang:tilelang.env:WARNING]: Loading tilelang libs from dev root: /home/z00910011/tilelang-ascend-test/tilelang-ascend/build
 Warning: The current version of the file storing weights is old, and it is relanded due to internal bug of torch and compatibility issue. We will deprecate the loading support for this type of file in the future, please use newer torch to re-store the weight file.
 ====== TVM IR ======
 # from tvm.script import ir as I
@@ -1210,7 +1210,7 @@ module attributes {hivm.module_core_type = #hivm.module_core_type<AIC>, memref.m
 }
 
 
-loc("input.mlir":127:13): error: operand #1 does not dominate this use
+loc("input.mlir":102:9): error: operand #1 does not dominate this use
 // -----// IR Dump After TileLangIRCVSplit Failed (tilelangir-cv-split) ('func.func' operation: @sparseAttnMix) //----- //
 "builtin.module"() ({
   "func.func"() <{arg_attrs = [{hacc.arg_type = #hacc.arg_type<ffts_base_address>}, {}, {hacc.arg_type = #hacc.arg_type<workspace>}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}], function_type = (i64, memref<?xi8>, memref<?xi8>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xf32, #hivm.address_space<gm>>, memref<?xi32, #hivm.address_space<gm>>, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> (), sym_name = "sparseAttnMix"}> ({
@@ -1296,6 +1296,7 @@ loc("input.mlir":127:13): error: operand #1 does not dominate this use
       "scf.for"(%20, %65, %23) ({
       ^bb0(%arg20: i32):
         %86 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<32xi32, strided<[1]>>
+        "hivm.hir.vbrc"(%4, %110) <{broadcast_dims = array<i64>}> : (f32, memref<1x32xf32, strided<[32, 1]>>) -> ()
         %87 = "arith.divsi"(%41, %arg9) : (i32, i32) -> i32
         %88 = "arith.index_cast"(%87) : (i32) -> index
         %89 = "arith.remsi"(%41, %arg9) : (i32, i32) -> i32
@@ -1308,100 +1309,99 @@ loc("input.mlir":127:13): error: operand #1 does not dominate this use
         %96 = "memref.subview"(%34, %88, %90, %92, %95) <{operandSegmentSizes = array<i32: 1, 3, 1, 0>, static_offsets = array<i64: -9223372036854775808, -9223372036854775808, -9223372036854775808>, static_sizes = array<i64: 1, 1, -9223372036854775808>, static_strides = array<i64: 1, 1, 1>}> : (memref<?x?x?xi32, strided<[?, ?, ?]>, #hivm.address_space<gm>>, index, index, index, index) -> memref<?xi32, strided<[?], offset: ?>, #hivm.address_space<gm>>
         %97 = "memref.subview"(%86, %95) <{operandSegmentSizes = array<i32: 1, 0, 1, 0>, static_offsets = array<i64: 0>, static_sizes = array<i64: -9223372036854775808>, static_strides = array<i64: 1>}> : (memref<32xi32, strided<[1]>>, index) -> memref<?xi32, strided<[1]>>
         "memref.copy"(%96, %97) : (memref<?xi32, strided<[?], offset: ?>, #hivm.address_space<gm>>, memref<?xi32, strided<[1]>>) -> ()
-        "scf.for"(%20, %94, %23) ({
-        ^bb0(%arg21: i32):
-          %131 = "arith.index_cast"(%arg21) : (i32) -> index
-          %132 = "memref.load"(%86, %131) : (memref<32xi32, strided<[1]>>, index) -> i32
-          %133 = "arith.cmpi"(%132, %14) <{predicate = 1 : i64}> : (i32, i32) -> i1
-          "scf.if"(%133) ({
-            %134 = "arith.index_cast"(%arg21) : (i32) -> index
-            "memref.store"(%13, %105, %2, %134) : (f32, memref<1x32xf32, strided<[32, 1]>>, index, index) -> ()
-            %135 = "arith.divsi"(%41, %arg9) : (i32, i32) -> i32
-            %136 = "arith.index_cast"(%135) : (i32) -> index
-            %137 = "arith.index_cast"(%132) : (i32) -> index
-            %138 = "memref.subview"(%38, %136, %137) <{operandSegmentSizes = array<i32: 1, 2, 0, 0>, static_offsets = array<i64: -9223372036854775808, -9223372036854775808, 0>, static_sizes = array<i64: 1, 1, 512>, static_strides = array<i64: 1, 1, 1>}> : (memref<?x?x512xbf16, strided<[?, ?, ?]>, #hivm.address_space<gm>>, index, index) -> memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>
-            %139 = "memref.subview"(%130, %134) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 1, 512>, static_strides = array<i64: 1, 1>}> : (memref<32x512xbf16, strided<[512, 1]>>, index) -> memref<512xbf16, strided<[1], offset: ?>>
-            "memref.copy"(%138, %139) : (memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>, memref<512xbf16, strided<[1], offset: ?>>) -> ()
-            "scf.yield"() : () -> ()
-          }, {
-          }) : (i1) -> ()
-          "scf.yield"() : () -> ()
-        }) : (i32, i32, i32) -> ()
-        %98 = "arith.muli"(%43, %11) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
-        %99 = "arith.index_cast"(%98) : (i32) -> index
+        %98 = "memref.subview"(%45) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32>) -> memref<32xf32, strided<[1]>>
+        %99 = "arith.muli"(%43, %11) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+        %100 = "arith.index_cast"(%99) : (i32) -> index
+        %101 = "memref.subview"(%50) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
+        %102 = "memref.subview"(%51) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
+        "memref.copy"(%101, %102) : (memref<8xf32, strided<[1]>>, memref<8xf32, strided<[1]>>) -> ()
         "scope.scope"() ({
           %130 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<32x512xbf16, strided<[512, 1]>>
           "hivm.hir.vbrc"(%3, %130) <{broadcast_dims = array<i64>}> : (bf16, memref<32x512xbf16, strided<[512, 1]>>) -> ()
+          "scf.for"(%20, %94, %23) ({
+          ^bb0(%arg21: i32):
+            %131 = "arith.index_cast"(%arg21) : (i32) -> index
+            %132 = "memref.load"(%86, %131) : (memref<32xi32, strided<[1]>>, index) -> i32
+            %133 = "arith.cmpi"(%132, %14) <{predicate = 1 : i64}> : (i32, i32) -> i1
+            "scf.if"(%133) ({
+              %134 = "arith.index_cast"(%arg21) : (i32) -> index
+              "memref.store"(%13, %110, %2, %134) : (f32, memref<1x32xf32, strided<[32, 1]>>, index, index) -> ()
+              %135 = "arith.divsi"(%41, %arg9) : (i32, i32) -> i32
+              %136 = "arith.index_cast"(%135) : (i32) -> index
+              %137 = "arith.index_cast"(%132) : (i32) -> index
+              %138 = "memref.subview"(%38, %136, %137) <{operandSegmentSizes = array<i32: 1, 2, 0, 0>, static_offsets = array<i64: -9223372036854775808, -9223372036854775808, 0>, static_sizes = array<i64: 1, 1, 512>, static_strides = array<i64: 1, 1, 1>}> : (memref<?x?x512xbf16, strided<[?, ?, ?]>, #hivm.address_space<gm>>, index, index) -> memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>
+              %139 = "memref.subview"(%130, %134) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 1, 512>, static_strides = array<i64: 1, 1>}> : (memref<32x512xbf16, strided<[512, 1]>>, index) -> memref<512xbf16, strided<[1], offset: ?>>
+              "memref.copy"(%138, %139) : (memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>, memref<512xbf16, strided<[1], offset: ?>>) -> ()
+              "scf.yield"() : () -> ()
+            }, {
+            }) : (i1) -> ()
+            "scf.yield"() : () -> ()
+          }) : (i32, i32, i32) -> ()
           "memref.copy"(%130, %44) : (memref<32x512xbf16, strided<[512, 1]>>, memref<32x512xbf16>) -> ()
           "scope.return"() : () -> ()
         }) {hivm.tcore_type = #hivm.tcore_type<VECTOR>} : () -> ()
         "scope.scope"() ({
-          %104 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xbf16, strided<[32, 1]>>
-          %105 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<1x32xf32, strided<[32, 1]>>
-          %106 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
-          %107 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
-          %108 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
-          %109 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x512xf32, strided<[512, 1]>>
-          %110 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
-          %111 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
-          %112 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
-          %113 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
-          %114 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<1x32xf32, strided<[32, 1]>>
-          %115 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
-          %116 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
-          "hivm.hir.vbrc"(%4, %105) <{broadcast_dims = array<i64>}> : (f32, memref<1x32xf32, strided<[32, 1]>>) -> ()
-          %117 = "memref.subview"(%105) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
-          %118 = "memref.subview"(%45) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32>) -> memref<32xf32, strided<[1]>>
-          "memref.copy"(%117, %118) : (memref<32xf32, strided<[1]>>, memref<32xf32, strided<[1]>>) -> ()
-          %119 = "memref.subview"(%46, %99) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 8, 32>, static_strides = array<i64: 1, 1>}> : (memref<16x32xf32>, index) -> memref<8x32xf32, strided<[32, 1], offset: ?>>
-          "memref.copy"(%119, %106) : (memref<8x32xf32, strided<[32, 1], offset: ?>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          %120 = "memref.subview"(%45) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32>) -> memref<32xf32, strided<[1]>>
-          %121 = "memref.subview"(%105) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
-          "memref.copy"(%120, %121) : (memref<32xf32, strided<[1]>>, memref<32xf32, strided<[1]>>) -> ()
-          %122 = "memref.subview"(%50) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
-          %123 = "memref.subview"(%51) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
-          "memref.copy"(%122, %123) : (memref<8xf32, strided<[1]>>, memref<8xf32, strided<[1]>>) -> ()
-          "hivm.hir.vmul"(%106, %10, %106) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, f32, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          "hivm.hir.vreduce"(%106, %50) <{arith = #hivm.reduce_op<max>, operandSegmentSizes = array<i32: 1, 1, 0, 0>, reduce_dims = array<i64: 1>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
-          "hivm.hir.vsub"(%51, %50, %110) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
-          "hivm.hir.vexp"(%110, %107) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 1, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
-          %124 = "memref.subview"(%50) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
-          %125 = "memref.subview"(%111) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
-          "memref.copy"(%124, %125) : (memref<8xf32, strided<[1]>>, memref<8xf32, strided<[1]>>) -> ()
-          "hivm.hir.vbrc"(%111, %112) <{broadcast_dims = array<i64: 1>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          "hivm.hir.vsub"(%106, %112, %113) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          "hivm.hir.vexp"(%113, %106) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 1, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          %126 = "memref.subview"(%105) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
-          %127 = "memref.subview"(%114) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
-          "memref.copy"(%126, %127) : (memref<32xf32, strided<[1]>>, memref<32xf32, strided<[1]>>) -> ()
-          "hivm.hir.vbrc"(%114, %115) <{broadcast_dims = array<i64: 0>}> : (memref<1x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          "hivm.hir.vmul"(%106, %115, %106) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
-          "hivm.hir.vreduce"(%106, %108) <{arith = #hivm.reduce_op<sum>, operandSegmentSizes = array<i32: 1, 1, 0, 0>, reduce_dims = array<i64: 1>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
-          "hivm.hir.vmul"(%52, %107, %116) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
-          "hivm.hir.vadd"(%116, %108, %52) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
-          "hivm.hir.vcast"(%106, %104) <{broadcast = array<i64>, cast = #hivm.cast<cast_signed>, operandSegmentSizes = array<i32: 1, 1, 0>, round_mode = #hivm.round_mode<rint>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xbf16, strided<[32, 1]>>) -> ()
-          %128 = "memref.subview"(%47, %99) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 8, 32>, static_strides = array<i64: 1, 1>}> : (memref<16x32xbf16>, index) -> memref<8x32xbf16, strided<[32, 1], offset: ?>>
-          "memref.copy"(%104, %128) : (memref<8x32xbf16, strided<[32, 1]>>, memref<8x32xbf16, strided<[32, 1], offset: ?>>) -> ()
-          %129 = "memref.subview"(%48, %99) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 8, 512>, static_strides = array<i64: 1, 1>}> : (memref<16x512xf32>, index) -> memref<8x512xf32, strided<[512, 1], offset: ?>>
-          "memref.copy"(%129, %109) : (memref<8x512xf32, strided<[512, 1], offset: ?>>, memref<8x512xf32, strided<[512, 1]>>) -> ()
-          "hivm.hir.vmul"(%53, %107, %53) <{broadcast = array<i64: 1>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x512xf32, strided<[512, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x512xf32, strided<[512, 1]>>) -> ()
-          "hivm.hir.vadd"(%53, %109, %53) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x512xf32, strided<[512, 1]>>, memref<8x512xf32, strided<[512, 1]>>, memref<8x512xf32, strided<[512, 1]>>) -> ()
+          %105 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<32x512xbf16, strided<[512, 1]>>
+          %106 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<16x32xbf16, strided<[32, 1]>>
+          %107 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<16x32xf32, strided<[32, 1]>>
+          %108 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xbf16, strided<[32, 1]>>
+          %109 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<16x512xf32, strided<[512, 1]>>
+          %110 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<1x32xf32, strided<[32, 1]>>
+          %111 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
+          %112 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
+          %113 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
+          %114 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
+          %115 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
+          %116 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
+          %117 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
+          %118 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<1x32xf32, strided<[32, 1]>>
+          %119 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x32xf32, strided<[32, 1]>>
+          %120 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x1xf32, strided<[1, 1]>>
+          %121 = "memref.subview"(%110) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
+          "memref.copy"(%121, %98) : (memref<32xf32, strided<[1]>>, memref<32xf32, strided<[1]>>) -> ()
+          "memref.copy"(%44, %105) : (memref<32x512xbf16>, memref<32x512xbf16, strided<[512, 1]>>) -> ()
+          "hivm.hir.mmadL1"(%49, %105, %12, %1, %7, %0, %107) <{b_transpose, operandSegmentSizes = array<i32: 1, 1, 1, 1, 1, 1, 1, 0, 0, 0>}> : (memref<16x512xbf16, strided<[512, 1]>>, memref<32x512xbf16, strided<[512, 1]>>, i1, index, index, index, memref<16x32xf32, strided<[32, 1]>>) -> ()
+          "memref.copy"(%107, %46) : (memref<16x32xf32, strided<[32, 1]>>, memref<16x32xf32>) -> ()
+          %122 = "memref.subview"(%46, %100) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 8, 32>, static_strides = array<i64: 1, 1>}> : (memref<16x32xf32>, index) -> memref<8x32xf32, strided<[32, 1], offset: ?>>
+          "memref.copy"(%122, %111) : (memref<8x32xf32, strided<[32, 1], offset: ?>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          %123 = "memref.subview"(%45) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32>) -> memref<32xf32, strided<[1]>>
+          %124 = "memref.subview"(%110) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
+          "memref.copy"(%123, %124) : (memref<32xf32, strided<[1]>>, memref<32xf32, strided<[1]>>) -> ()
+          "hivm.hir.vmul"(%111, %10, %111) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, f32, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          "hivm.hir.vreduce"(%111, %50) <{arith = #hivm.reduce_op<max>, operandSegmentSizes = array<i32: 1, 1, 0, 0>, reduce_dims = array<i64: 1>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
+          "hivm.hir.vsub"(%51, %50, %114) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
+          "hivm.hir.vexp"(%114, %112) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 1, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
+          %125 = "memref.subview"(%50) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
+          %126 = "memref.subview"(%115) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 8, 1>, static_strides = array<i64: 1, 1>}> : (memref<8x1xf32, strided<[1, 1]>>) -> memref<8xf32, strided<[1]>>
+          "memref.copy"(%125, %126) : (memref<8xf32, strided<[1]>>, memref<8xf32, strided<[1]>>) -> ()
+          "hivm.hir.vbrc"(%115, %116) <{broadcast_dims = array<i64: 1>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          "hivm.hir.vsub"(%111, %116, %117) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          "hivm.hir.vexp"(%117, %111) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 1, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          %127 = "memref.subview"(%110) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
+          %128 = "memref.subview"(%118) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>>) -> memref<32xf32, strided<[1]>>
+          "memref.copy"(%127, %128) : (memref<32xf32, strided<[1]>>, memref<32xf32, strided<[1]>>) -> ()
+          "hivm.hir.vbrc"(%118, %119) <{broadcast_dims = array<i64: 0>}> : (memref<1x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          "hivm.hir.vmul"(%111, %119, %111) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>, memref<8x32xf32, strided<[32, 1]>>) -> ()
+          "hivm.hir.vreduce"(%111, %113) <{arith = #hivm.reduce_op<sum>, operandSegmentSizes = array<i32: 1, 1, 0, 0>, reduce_dims = array<i64: 1>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
+          "hivm.hir.vmul"(%52, %112, %120) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
+          "hivm.hir.vadd"(%120, %113, %52) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x1xf32, strided<[1, 1]>>) -> ()
+          "hivm.hir.vcast"(%111, %108) <{broadcast = array<i64>, cast = #hivm.cast<cast_signed>, operandSegmentSizes = array<i32: 1, 1, 0>, round_mode = #hivm.round_mode<rint>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>>, memref<8x32xbf16, strided<[32, 1]>>) -> ()
+          %129 = "memref.subview"(%47, %100) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 8, 32>, static_strides = array<i64: 1, 1>}> : (memref<16x32xbf16>, index) -> memref<8x32xbf16, strided<[32, 1], offset: ?>>
+          "memref.copy"(%108, %129) : (memref<8x32xbf16, strided<[32, 1]>>, memref<8x32xbf16, strided<[32, 1], offset: ?>>) -> ()
+          "memref.copy"(%47, %106) : (memref<16x32xbf16>, memref<16x32xbf16, strided<[32, 1]>>) -> ()
+          "memref.copy"(%44, %105) : (memref<32x512xbf16>, memref<32x512xbf16, strided<[512, 1]>>) -> ()
+          "hivm.hir.mmadL1"(%106, %105, %12, %1, %0, %7, %109) <{operandSegmentSizes = array<i32: 1, 1, 1, 1, 1, 1, 1, 0, 0, 0>}> : (memref<16x32xbf16, strided<[32, 1]>>, memref<32x512xbf16, strided<[512, 1]>>, i1, index, index, index, memref<16x512xf32, strided<[512, 1]>>) -> ()
+          "memref.copy"(%109, %48) : (memref<16x512xf32, strided<[512, 1]>>, memref<16x512xf32>) -> ()
+          "hivm.hir.vmul"(%53, %112, %53) <{broadcast = array<i64: 1>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x512xf32, strided<[512, 1]>>, memref<8x1xf32, strided<[1, 1]>>, memref<8x512xf32, strided<[512, 1]>>) -> ()
+          "scope.return"() : () -> ()
+        }) {hivm.tcore_type = #hivm.tcore_type<CUBE_AND_VECTOR>} : () -> ()
+        "scope.scope"() ({
+          %103 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<8x512xf32, strided<[512, 1]>>
+          %104 = "memref.subview"(%48, %100) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 8, 512>, static_strides = array<i64: 1, 1>}> : (memref<16x512xf32>, index) -> memref<8x512xf32, strided<[512, 1], offset: ?>>
+          "memref.copy"(%104, %103) : (memref<8x512xf32, strided<[512, 1], offset: ?>>, memref<8x512xf32, strided<[512, 1]>>) -> ()
+          "hivm.hir.vadd"(%53, %103, %53) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x512xf32, strided<[512, 1]>>, memref<8x512xf32, strided<[512, 1]>>, memref<8x512xf32, strided<[512, 1]>>) -> ()
           "scope.return"() : () -> ()
         }) {hivm.tcore_type = #hivm.tcore_type<VECTOR>} : () -> ()
-        "scope.scope"() ({
-          %100 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<32x512xbf16, strided<[512, 1]>>
-          %101 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<16x32xbf16, strided<[32, 1]>>
-          %102 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<16x32xf32, strided<[32, 1]>>
-          %103 = "memref.alloc"() <{operandSegmentSizes = array<i32: 0, 0>}> : () -> memref<16x512xf32, strided<[512, 1]>>
-          "memref.copy"(%44, %100) : (memref<32x512xbf16>, memref<32x512xbf16, strided<[512, 1]>>) -> ()
-          "hivm.hir.mmadL1"(%49, %100, %12, %1, %7, %0, %102) <{b_transpose, operandSegmentSizes = array<i32: 1, 1, 1, 1, 1, 1, 1, 0, 0, 0>}> : (memref<16x512xbf16, strided<[512, 1]>>, memref<32x512xbf16, strided<[512, 1]>>, i1, index, index, index, memref<16x32xf32, strided<[32, 1]>>) -> ()
-          "memref.copy"(%102, %46) : (memref<16x32xf32, strided<[32, 1]>>, memref<16x32xf32>) -> ()
-          "memref.copy"(%47, %101) : (memref<16x32xbf16>, memref<16x32xbf16, strided<[32, 1]>>) -> ()
-          "memref.copy"(%44, %100) : (memref<32x512xbf16>, memref<32x512xbf16, strided<[512, 1]>>) -> ()
-          "hivm.hir.mmadL1"(%101, %100, %12, %1, %0, %7, %103) <{operandSegmentSizes = array<i32: 1, 1, 1, 1, 1, 1, 1, 0, 0, 0>}> : (memref<16x32xbf16, strided<[32, 1]>>, memref<32x512xbf16, strided<[512, 1]>>, i1, index, index, index, memref<16x512xf32, strided<[512, 1]>>) -> ()
-          "memref.copy"(%103, %48) : (memref<16x512xf32, strided<[512, 1]>>, memref<16x512xf32>) -> ()
-          "scope.return"() : () -> ()
-        }) {hivm.tcore_type = #hivm.tcore_type<CUBE>} : () -> ()
         "scf.yield"() : () -> ()
       }) {tilelangir.num_stages = 2 : i32} : (i32, i32, i32) -> ()
       "scf.for"(%20, %11, %23) ({
@@ -1474,4 +1474,4 @@ Traceback (most recent call last):
     return self._pp.run(mlir_str)
            ^^^^^^^^^^^^^^^^^^^^^^
 RuntimeError: Pass pipeline run failed
-[ERROR] 2026-04-28-16:34:30 (PID:4033887, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+[ERROR] 2026-04-28-19:29:32 (PID:367979, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
