@@ -221,11 +221,12 @@ def sparse_attn_mix_kernel(
 
                 # top-k 所有分块结束后，把 attention sink 加进 softmax 分母；
                 # sink 只改变归一化分母，不产生 value 项。
-                T.copy(
-                    AttnSink[n * block_heads + vid * block_heads_half],
-                    scores_max_prev[:, 0],
-                    size=[block_heads_half],
-                )
+                for i in T.Parallel(block_heads_half):
+                    head_idx = n * block_heads + vid * block_heads_half + i
+                    if head_idx < num_heads:
+                        scores_max_prev[i, 0] = AttnSink[head_idx]
+                    else:
+                        scores_max_prev[i, 0] = value_min
                 for i in T.Parallel(block_heads_half):
                     sum_exp[i, 0] += T.exp(scores_max_prev[i, 0] - scores_max[i, 0])
                 T.vdiv(acc_o, sum_exp, acc_o)
