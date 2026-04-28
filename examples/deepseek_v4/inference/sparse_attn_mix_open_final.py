@@ -24,16 +24,27 @@ def sparse_attn_mix_kernel(
     accum_dtype=FP32,
     indices_dtype=INT32,
 ):
+    # 编译期 tile 参数：
+    # - block_top_k：沿 sparse KV token 维度(top_k)的分块大小，例如每次处理 32 个候选 KV。
+    # - block_heads：沿 Q 的 num_heads 维度的分块大小，例如每次处理 16 个 Q heads。
+    # - num_heads：Q 的注意力头数量；本 kernel 的 KV 没有 head 维度，更接近 MQA/shared-KV。
+    # - dim：每个 head 的向量维度，也是 Q/K/V 点积的归约维。
+    # - multibuffer：mix pass 扩展 workspace 后的 ping-pong buffer 数量，同时也是 pipeline stage 数。
+    # - scale：attention score 的缩放因子，默认 1/sqrt(dim)。
     if scale is None:
         scale = (1.0 / dim) ** 0.5
 
     assert block_heads % 2 == 0, "mix kernel maps one cube block to two vector sub-blocks"
 
+    # 运行期符号维度：
+    # batch_size/seq_len 来自 Q；seq_len_kv 来自 KV；top_k 来自 TopKIndices 最后一维。
     batch_size = T.symbolic("batchSize")
     seq_len = T.symbolic("seqLen")
     seq_len_kv = T.symbolic("seqLenKV")
     top_k = T.symbolic("topK")
 
+    # mix 模式下一个 Cube tile 负责 block_heads 个 head，两个 Vector 逻辑核
+    # 通过 vid 分别处理前/后 block_heads_half 个 head，形成 CV 1:2 的划分。
     block_heads_half = block_heads // 2
 
     @T.prim_func
@@ -44,12 +55,21 @@ def sparse_attn_mix_kernel(
         AttnSink: T.Tensor((num_heads,), accum_dtype),
         TopKIndices: T.Tensor((batch_size, seq_len, top_k), indices_dtype),
     ):
+        # 张量语义：
+        # - Q[b, s, h, d]：query token s 在 head h 上的向量。
+        # - KV[b, skv, d]：被所有 Q heads 共享的 key/value 向量；这里没有 kv_head 维度。
+        # - TopKIndices[b, s, t]：query token s 只关注的第 t 个 KV token 下标，-1 表示无效。
+        # - AttnSink[h]：每个 Q head 的 sink 项，只加入 softmax 分母，不参与 P*V。
+        # - Output[b, s, h, d]：每个 query token、每个 Q head 的输出向量。
+        # cid 对应一个 query 位置 (batch, seq)，同一个 cid 下用 vid=0/1
+        # 切分 Vector 侧 head 子块；Cube 侧按完整 block_heads 做矩阵乘。
         with T.Kernel(batch_size * seq_len, is_npu=True) as (cid, vid):
             by = cid // seq_len
             bx = cid % seq_len
             value_zero = 0
             value_min = -T.infinity(accum_dtype)
 
+            # Cube 侧本地 tile：q_shared/kv_shared 进入 QK 和 PV 两次 GEMM。
             q_shared = T.alloc_shared((block_heads, dim), dtype)
             kv_shared = T.alloc_shared((block_top_k, dim), dtype)
             prob_shared = T.alloc_shared((block_heads, block_top_k), dtype)
@@ -57,6 +77,7 @@ def sparse_attn_mix_kernel(
             scores_cast = T.alloc_shared((block_heads_half, block_top_k), dtype)
             pv_acc = T.alloc_fragment((block_heads, dim), accum_dtype)
 
+            # Vector 侧本地 tile：负责 gather 稀疏 KV、mask、online softmax 和输出累加。
             kv_ub = T.alloc_shared((block_top_k, dim), dtype)
             idxs = T.alloc_fragment((block_top_k,), indices_dtype)
             mask_ub = T.alloc_shared((1, block_top_k), accum_dtype)
@@ -70,6 +91,8 @@ def sparse_attn_mix_kernel(
             acc_o_new = T.alloc_shared((block_heads_half, dim), accum_dtype)
             o_cast = T.alloc_shared((block_heads_half, dim), dtype)
 
+            # workspace 是 Cube/Vector 边界的 GM 中转区，也是 mix pass 做
+            # multi-buffer 扩展和自动 set/wait 同步的锚点。
             workspace_kv = T.alloc_workspace(
                 (block_top_k, dim), dtype, multi_buffer=multibuffer
             )
@@ -86,16 +109,29 @@ def sparse_attn_mix_kernel(
                 (block_heads, dim), accum_dtype, multi_buffer=multibuffer
             )
 
-            # The mix lowering treats a pipelined loop as the C/V pipeline region.
+            # 外层按 head block 遍历。这里必须是普通 serial loop，当前 mix pass
+            # 会把 T.Pipelined 当成一个 C/V 流水区域，不能嵌套多个 pipeline。
             for n in T.serial(T.ceildiv(num_heads, block_heads)):
+                # n 选择当前 Q head 范围：
+                # [n * block_heads, min((n + 1) * block_heads, num_heads))。
+                # head 维不是 attention 的归约维，不同 head 输出互相独立。
                 T.vbrc(value_zero, acc_o)
                 T.vbrc(value_zero, sum_exp)
                 T.vbrc(value_min, scores_max)
+                # 固定 cid 后，Q 的 seq 维已经是当前 bx；这里拷贝的是
+                # 当前 query token 在一个 head block 上的 [block_heads, dim]。
                 T.copy(Q[by, bx, n * block_heads, 0], q_shared, size=[block_heads, dim])
 
+                # 内层按 top_k 分块做 sparse attention。该 loop 是唯一的 mix
+                # pipeline 区域，后续 pass 会围绕它做 multi-buffer 和 C/V 同步。
                 for k in T.Pipelined(T.ceildiv(top_k, block_top_k), num_stages=multibuffer):
+                    # k 选择当前 sparse KV token 范围：
+                    # [k * block_top_k, min((k + 1) * block_top_k, top_k))。
+                    # top_k 是每个 query 预选出来的稀疏 KV 序列长度，不是完整 seq_len_kv。
                     real_block_top_k = T.min(top_k - k * block_top_k, block_top_k)
 
+                    # Vector 阶段 1：读取本 query 的 top-k 索引，按索引从 KV
+                    # gather 出稀疏 K/V tile；-1 表示无效位置，对应 mask=0。
                     T.vbrc(value_zero, kv_ub)
                     T.vbrc(value_zero, mask_ub)
                     T.copy(
@@ -112,6 +148,10 @@ def sparse_attn_mix_kernel(
                     T.copy(kv_ub, workspace_kv, size=[block_top_k, dim])
                     T.copy(mask_ub, workspace_mask, size=[1, block_top_k])
 
+                    # Cube 阶段 1：从 workspace 回灌 KV 到 L1，计算
+                    # scores = Q * K^T，得到 block_heads x block_top_k 的分数。
+                    # 形状上等价于：
+                    # [block_heads, dim] @ [dim, block_top_k] -> [block_heads, block_top_k]。
                     T.copy(workspace_kv, kv_shared, size=[block_top_k, dim])
                     T.gemm(
                         q_shared,
@@ -123,6 +163,8 @@ def sparse_attn_mix_kernel(
                     )
                     T.copy(scores, workspace_score, size=[block_heads, block_top_k])
 
+                    # Vector 阶段 2：每个 vid 只处理一半 heads。这里做在线
+                    # softmax：维护历史 max/sum，并把本块概率写回 workspace。
                     T.copy(
                         workspace_score[vid * block_heads_half, 0],
                         scores_ub,
@@ -130,6 +172,9 @@ def sparse_attn_mix_kernel(
                     )
                     T.copy(workspace_mask, mask_ub, size=[1, block_top_k])
 
+                    # online softmax 状态：
+                    # scores_max/sum_exp/acc_o 保存已经处理过的 top_k 分块结果；
+                    # scores_scale 用新旧 max 的差值修正历史分母和历史输出累加。
                     T.copy(scores_max, scores_max_prev)
                     T.vmul(scores_ub, scale, scores_ub)
                     T.reduce_max(scores_ub, scores_max, dim=1)
@@ -149,6 +194,10 @@ def sparse_attn_mix_kernel(
                         size=[block_heads_half, block_top_k],
                     )
 
+                    # Cube 阶段 2：读取两个 Vector 子块写好的概率，计算
+                    # P * V，输出完整 block_heads 的本块贡献到 workspace_out。
+                    # 形状上等价于：
+                    # [block_heads, block_top_k] @ [block_top_k, dim] -> [block_heads, dim]。
                     T.copy(workspace_prob, prob_shared, size=[block_heads, block_top_k])
                     T.copy(workspace_kv, kv_shared, size=[block_top_k, dim])
                     T.gemm(
@@ -160,6 +209,8 @@ def sparse_attn_mix_kernel(
                     )
                     T.copy(pv_acc, workspace_out, size=[block_heads, dim])
 
+                    # Vector 阶段 3：取自己负责的 half-head 输出块，结合
+                    # online softmax 的 scale 修正历史累加结果。
                     T.copy(
                         workspace_out[vid * block_heads_half, 0],
                         acc_o_new,
@@ -168,6 +219,8 @@ def sparse_attn_mix_kernel(
                     T.vmul(acc_o, scores_scale, acc_o)
                     T.vadd(acc_o, acc_o_new, acc_o)
 
+                # top-k 所有分块结束后，把 attention sink 加进 softmax 分母；
+                # sink 只改变归一化分母，不产生 value 项。
                 T.copy(
                     AttnSink[n * block_heads + vid * block_heads_half],
                     scores_max_prev[:, 0],
@@ -177,6 +230,7 @@ def sparse_attn_mix_kernel(
                     sum_exp[i, 0] += T.exp(scores_max_prev[i, 0] - scores_max[i, 0])
                 T.vdiv(acc_o, sum_exp, acc_o)
                 T.vcast(acc_o, o_cast, round_mode="rint")
+                # 最终每个 vid 写回自己负责的 half-head 输出。
                 real_heads = T.min(
                     block_heads_half,
                     num_heads - n * block_heads - vid * block_heads_half,
@@ -197,9 +251,18 @@ def sparse_attn(
     topk_idxs: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ):
+    # Python wrapper 入参：
+    # - q: [batch_size, seq_len, num_heads, dim]，Q 的完整多头输入。
+    # - kv: [batch_size, seq_len_kv, dim]，共享 KV；没有 kv_head 维度，因此是 MQA/shared-KV 形态。
+    # - attn_sink: [num_heads]，每个 Q head 一个 sink 标量。
+    # - topk_idxs: [batch_size, seq_len, top_k]，每个 query token 对应的稀疏 KV 下标。
+    # - softmax_scale: score 缩放因子，通常是 1/sqrt(dim)。
     block = 32
     block_heads = 16
     multibuffer = 2
+    # block 别名对应 kernel 里的 block_top_k；block_heads 对应 Q num_heads 维分块。
+    # 当前配置下，Cube 每次处理 16 个 Q heads x 32 个 sparse KV tokens，
+    # Vector 侧两个 vid 分别处理 8 个 Q heads。
     batch_size, seq_len, num_heads, dim = q.size()
     if (
         not hasattr(sparse_attn, "kernel")
@@ -208,6 +271,8 @@ def sparse_attn(
         or sparse_attn.top_k != topk_idxs.shape[-1]
     ):
         os.environ["TILELANG_ASCEND_MODE"] = "Expert"
+        # Expert/API lowering 才会把 T.alloc_workspace 降成 memref_ext.alloc_workspace，
+        # 后续 mix pass 依赖它识别 Cube/Vector 边界和 multi-buffer workspace。
         sparse_attn.kernel = sparse_attn_mix_kernel(
             block,
             block_heads,
