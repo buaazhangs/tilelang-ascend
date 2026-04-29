@@ -24,6 +24,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLExtras.h"
 
 namespace mlir::tilelangir {
 
@@ -64,24 +65,53 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
       // seed. Discovery intentionally follows only def chains from the
       // non-workspace endpoint. Following memref.alloc users here would flood
       // through reused UB storage and over-mark the graph.
-      DenseMap<Operation *, CopyOpInterface> allocOwnerSeed;
+      DenseMap<Operation *, Operation *> allocOwnerSeed;
       for (auto copyOp : workspaceCopySeeds) {
         llvm::SmallPtrSet<Operation *, 8> seedAllocs;
         collectLocalAllocsFromCopy(copyOp, seedAllocs);
         for (Operation *allocOp : seedAllocs) {
           auto owner = allocOwnerSeed.find(allocOp);
           if (owner == allocOwnerSeed.end()) {
-            allocOwnerSeed[allocOp] = copyOp;
-          } else if (owner->second.getOperation() != copyOp.getOperation()) {
+            allocOwnerSeed[allocOp] = copyOp.getOperation();
+          } else if (owner->second != copyOp.getOperation()) {
             sharedAllocOps.insert(allocOp);
           }
         }
       }
 
+      // A shared local alloc has two legal meanings in user DSL:
+      //   1. no explicit workspace->local reload in this scope: keep the alloc
+      //      in the parent loop and let scopes read the same persistent UB/L1.
+      //   2. explicit workspace->local reload in this scope: treat that reload
+      //      as creating a private local buffer for this scope.
+      //
+      // Track only case (2) here. Case (1) remains an external operand because
+      // sharedAllocOps are skipped when packing groups.
+      DenseMap<Operation *, SmallVector<Operation *>> reloadCopiesByAlloc;
       for (auto copyOp : workspaceCopySeeds) {
-          LDBG("Start from " << *copyOp.getOperation());
-          llvm::SmallPtrSet<Operation *, 32> visited;
-          visitGroupOfOps(copyOp, [&](Operation *op) {
+        if (!isValFromWorkspace(copyOp.getSource()))
+          continue;
+        Operation *targetAlloc = getLocalAllocRoot(copyOp.getTarget());
+        if (targetAlloc && sharedAllocOps.contains(targetAlloc))
+          reloadCopiesByAlloc[targetAlloc].push_back(copyOp.getOperation());
+      }
+
+      for (auto copyOp : workspaceCopySeeds) {
+        LDBG("Start from " << *copyOp.getOperation());
+        llvm::SmallPtrSet<Operation *, 32> visited;
+        bool groupHasOps = false;
+        Operation *reloadAlloc = nullptr;
+        Operation *reloadEnd = nullptr;
+        if (isValFromWorkspace(copyOp.getSource())) {
+          reloadAlloc = getLocalAllocRoot(copyOp.getTarget());
+          if (!reloadAlloc || !sharedAllocOps.contains(reloadAlloc))
+            reloadAlloc = nullptr;
+          if (reloadAlloc)
+            reloadEnd =
+                getNextReloadCopy(reloadAlloc, copyOp.getOperation(),
+                                  reloadCopiesByAlloc);
+        }
+        visitGroupOfOps(copyOp, [&](Operation *op) {
                 // Reused local buffers must stay in the parent loop so they
                 // dominate every C/V scope that reads or writes the same storage.
                 // Treat them as def-chain boundaries during grouping; otherwise
@@ -91,11 +121,14 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
                 auto it = opGroupId.find(op);
                 if (it == opGroupId.end()) {
                   opGroupId[op] = groupId;
+                  groupHasOps = true;
                   return false;
                 }
                 return it->second != groupId;
               },
-                              visited);
+                        visited, sharedAllocOps, reloadAlloc,
+                        copyOp.getOperation(), reloadEnd);
+        if (groupHasOps)
           groupId++;
       }
 
@@ -103,12 +136,20 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
                                             hivm::TCoreType::CUBE_OR_VECTOR);
       SmallVector<SmallVector<Operation *>> groups(groupId);
       SmallVector<std::vector<Mapper>> groupResults(groupId);
+      SmallVector<SmallVector<Operation *>> groupPrivateAllocs(groupId);
       for (auto &op : body->getOperations()) {
         if (sharedAllocOps.contains(&op))
           continue;
         if (opGroupId.find(&op) == opGroupId.end())
           continue;
         const auto id = opGroupId[&op];
+        if (auto copyOp = dyn_cast<CopyOpInterface>(op)) {
+          if (isValFromWorkspace(copyOp.getSource())) {
+            Operation *targetAlloc = getLocalAllocRoot(copyOp.getTarget());
+            if (targetAlloc && sharedAllocOps.contains(targetAlloc))
+              addUnique(groupPrivateAllocs[id], targetAlloc);
+          }
+        }
         auto opCoreType = hivm::TCoreType::CUBE_OR_VECTOR;
         if (auto hivmOp = dyn_cast<hivm::HIVMStructuredOp>(op);
             hivmOp && hivmOp.getCoreType())
@@ -141,32 +182,48 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
       }
 
       OpBuilder builder(body->getTerminator());
-      for (auto &&[coreType, group, groupResults] :
-           llvm::zip(coreType, groups, groupResults)) {
+      for (std::size_t id = 0; id < groups.size(); ++id) {
+        auto &group = groups[id];
+        auto &resultMaps = groupResults[id];
         auto scope = builder.create<scope::ScopeOp>(
             builder.getUnknownLoc(),
-            TypeRange(llvm::map_to_vector(groupResults, [](const Mapper &map) {
+            TypeRange(llvm::map_to_vector(resultMaps, [](const Mapper &map) {
               return map.use.get().getType();
             })));
-        for (auto &&[id, map] : llvm::enumerate(groupResults)) {
-          map.use.assign(scope.getResult(id));
+        for (auto &&[resultId, map] : llvm::enumerate(resultMaps)) {
+          map.use.assign(scope.getResult(resultId));
         }
         scope->setAttr(hivm::TCoreTypeAttr::name,
-                       builder.getAttr<hivm::TCoreTypeAttr>(coreType));
+                       builder.getAttr<hivm::TCoreTypeAttr>(coreType[id]));
 
-        auto &body = scope.getRegion().emplaceBlock();
+        auto &scopeBody = scope.getRegion().emplaceBlock();
+        DenseMap<Value, Value> privateAllocMap;
+        OpBuilder allocBuilder(&scopeBody, scopeBody.begin());
+        for (Operation *allocOp : groupPrivateAllocs[id]) {
+          Operation *clonedAlloc = allocBuilder.clone(*allocOp);
+          privateAllocMap[allocOp->getResult(0)] = clonedAlloc->getResult(0);
+        }
         for (auto op : group) {
-          op->moveBefore(&body, body.end());
+          op->moveBefore(&scopeBody, scopeBody.end());
+        }
+        if (!privateAllocMap.empty()) {
+          scope.walk([&](Operation *op) {
+            for (OpOperand &operand : op->getOpOperands()) {
+              auto it = privateAllocMap.find(operand.get());
+              if (it != privateAllocMap.end())
+                operand.set(it->second);
+            }
+          });
         }
 
         OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPointToEnd(&body);
+        builder.setInsertionPointToEnd(&scopeBody);
         builder.create<scope::ReturnOp>(
             builder.getUnknownLoc(),
             ValueRange(llvm::map_to_vector(
-                groupResults, [](Mapper &map) -> Value { return map.def; })));
+                resultMaps, [](Mapper &map) -> Value { return map.def; })));
 
-        LDBG("Packed a " << hivm::stringifyTCoreType(coreType)
+        LDBG("Packed a " << hivm::stringifyTCoreType(coreType[id])
                          << "-core scope:\n"
                          << scope);
       }
@@ -177,9 +234,9 @@ private:
   scf::ForOp currentForOp;
 
   bool touchesMarkedLocalBoundary(Operation *op) {
-    for(auto *user:op->getUsers()){
+    for (auto *user : op->getUsers()) {
       auto markOp = dyn_cast<annotation::MarkOp>(user);
-      if(markOp && markOp->hasAttr("hivm.multi_buffer")){
+      if (markOp && markOp->hasAttr("hivm.multi_buffer")) {
         return true;
       }
     }
@@ -223,14 +280,83 @@ private:
     }
   }
 
+  Operation *getLocalAllocRoot(Value val) {
+    auto definingOp = val.getDefiningOp();
+    if (!definingOp)
+      return nullptr;
+    if (isa<memref::AllocOp>(definingOp))
+      return definingOp;
+    if (auto viewOp = dyn_cast<ViewLikeOpInterface>(definingOp))
+      return getLocalAllocRoot(viewOp.getViewSource());
+    return nullptr;
+  }
+
+  Operation *getNextReloadCopy(
+      Operation *allocOp, Operation *start,
+      DenseMap<Operation *, SmallVector<Operation *>> &reloadCopiesByAlloc) {
+    Operation *next = nullptr;
+    auto reloadIt = reloadCopiesByAlloc.find(allocOp);
+    if (reloadIt == reloadCopiesByAlloc.end())
+      return nullptr;
+    for (Operation *candidate : reloadIt->second) {
+      if (candidate == start)
+        continue;
+      if (!start->isBeforeInBlock(candidate))
+        continue;
+      if (!next || candidate->isBeforeInBlock(next))
+        next = candidate;
+    }
+    return next;
+  }
+
+  bool isInReloadEpoch(Operation *op, Operation *start, Operation *end) {
+    Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
+    if (!scopeUnit)
+      return false;
+    if (scopeUnit != start && scopeUnit->isBeforeInBlock(start))
+      return false;
+    if (end && (scopeUnit == end || end->isBeforeInBlock(scopeUnit)))
+      return false;
+    return true;
+  }
+
+  void addUnique(SmallVectorImpl<Operation *> &ops, Operation *op) {
+    if (!llvm::is_contained(ops, op))
+      ops.push_back(op);
+  }
+
   void visitGroupOfOps(Operation *op,
                        llvm::function_ref<bool(Operation *)> visitor,
-                       llvm::SmallPtrSetImpl<Operation *> &visited) {
+                       llvm::SmallPtrSetImpl<Operation *> &visited,
+                       llvm::SmallPtrSetImpl<Operation *> &sharedAllocOps,
+                       Operation *reloadAlloc = nullptr,
+                       Operation *reloadStart = nullptr,
+                       Operation *reloadEnd = nullptr) {
     Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
     if (!scopeUnit)
       return;
     if (!visited.insert(scopeUnit).second)
       return;
+    if (sharedAllocOps.contains(scopeUnit)) {
+      // A shared alloc is a graph boundary: do not add it to any group, and do
+      // not let it connect unrelated workspace-copy seed trees. For an explicit
+      // reload into this alloc, continue only through users in the reload epoch
+      // [reloadStart, nextReload), then the scope packer clones the alloc and
+      // remaps those users to the private copy.
+      if (scopeUnit != reloadAlloc || !reloadStart)
+        return;
+      for (auto user : scopeUnit->getUsers()) {
+        if (!currentForOp->isProperAncestor(user))
+          continue;
+        if (isa<scf::YieldOp>(user))
+          continue;
+        if (!isInReloadEpoch(user, reloadStart, reloadEnd))
+          continue;
+        visitGroupOfOps(user, visitor, visited, sharedAllocOps, reloadAlloc,
+                        reloadStart, reloadEnd);
+      }
+      return;
+    }
     if (touchesMarkedLocalBoundary(scopeUnit))
       return;
     if (visitor(scopeUnit))
@@ -242,7 +368,8 @@ private:
         continue;
       if (isa<scf::YieldOp>(user))
         continue;
-      visitGroupOfOps(user, visitor, visited);
+      visitGroupOfOps(user, visitor, visited, sharedAllocOps, reloadAlloc,
+                      reloadStart, reloadEnd);
     }
 
     for (auto operand : op->getOperands()) {
@@ -252,7 +379,8 @@ private:
       if (isScalarOp(definingOp) ||
           isa<bishengir::memref_ext::AllocWorkspaceOp>(definingOp))
         continue;
-      visitGroupOfOps(definingOp, visitor, visited);
+      visitGroupOfOps(definingOp, visitor, visited, sharedAllocOps, reloadAlloc,
+                      reloadStart, reloadEnd);
     }
   }
 
