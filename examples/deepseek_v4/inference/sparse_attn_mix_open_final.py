@@ -80,6 +80,8 @@ def sparse_attn_mix_kernel(
             # Vector 侧本地 tile：负责 gather 稀疏 KV、mask、online softmax 和输出累加。
             kv_ub = T.alloc_shared((block_top_k, dim), dtype)
             idxs = T.alloc_fragment((block_top_k,), indices_dtype)
+            # mask 只在 Vector 侧参与 softmax，不作为 Cube 输入，因此保持 UB 常驻，
+            # 避免额外 workspace 搬运，也避免给 CVSplit 引入不必要的 seed。
             mask_ub = T.alloc_shared((1, block_top_k), accum_dtype)
             scores_ub = T.alloc_shared((block_heads_half, block_top_k), accum_dtype)
             scores_max = T.alloc_shared((block_heads_half, 1), accum_dtype)
@@ -95,9 +97,6 @@ def sparse_attn_mix_kernel(
             # multi-buffer 扩展和自动 set/wait 同步的锚点。
             workspace_kv = T.alloc_workspace(
                 (block_top_k, dim), dtype, multi_buffer=multibuffer
-            )
-            workspace_mask = T.alloc_workspace(
-                (1, block_top_k), accum_dtype, multi_buffer=multibuffer
             )
             workspace_score = T.alloc_workspace(
                 (block_heads, block_top_k), accum_dtype, multi_buffer=multibuffer
@@ -146,7 +145,6 @@ def sparse_attn_mix_kernel(
                             T.copy(KV[by, cur_idx, 0], kv_ub[i, 0], size=[1, dim])
 
                     T.copy(kv_ub, workspace_kv, size=[block_top_k, dim])
-                    T.copy(mask_ub, workspace_mask, size=[1, block_top_k])
 
                     # Cube 阶段 1：从 workspace 回灌 KV 到 L1，计算
                     # scores = Q * K^T，得到 block_heads x block_top_k 的分数。
@@ -170,7 +168,6 @@ def sparse_attn_mix_kernel(
                         scores_ub,
                         size=[block_heads_half, block_top_k],
                     )
-                    T.copy(workspace_mask, mask_ub, size=[1, block_top_k])
 
                     # online softmax 状态：
                     # scores_max/sum_exp/acc_o 保存已经处理过的 top_k 分块结果；

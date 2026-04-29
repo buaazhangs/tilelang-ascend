@@ -51,13 +51,43 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
 
       std::size_t groupId = 0;
       DenseMap<const Operation *, std::size_t> opGroupId;
-      for (auto copyOp : body->getOps<CopyOpInterface>())
-        for (auto val : {copyOp.getSource(), copyOp.getTarget()}) {
-          if (!isValFromWorkspace(val))
-            continue;
+      llvm::SmallPtrSet<Operation *, 8> sharedAllocOps;
+
+      SmallVector<CopyOpInterface> workspaceCopySeeds;
+      for (auto copyOp : body->getOps<CopyOpInterface>()) {
+        if (isValFromWorkspace(copyOp.getSource()) ||
+            isValFromWorkspace(copyOp.getTarget()))
+          workspaceCopySeeds.push_back(copyOp);
+      }
+
+      // First identify local buffers reached from more than one workspace copy
+      // seed. Discovery intentionally follows only def chains from the
+      // non-workspace endpoint. Following memref.alloc users here would flood
+      // through reused UB storage and over-mark the graph.
+      DenseMap<Operation *, CopyOpInterface> allocOwnerSeed;
+      for (auto copyOp : workspaceCopySeeds) {
+        llvm::SmallPtrSet<Operation *, 8> seedAllocs;
+        collectLocalAllocsFromCopy(copyOp, seedAllocs);
+        for (Operation *allocOp : seedAllocs) {
+          auto owner = allocOwnerSeed.find(allocOp);
+          if (owner == allocOwnerSeed.end()) {
+            allocOwnerSeed[allocOp] = copyOp;
+          } else if (owner->second.getOperation() != copyOp.getOperation()) {
+            sharedAllocOps.insert(allocOp);
+          }
+        }
+      }
+
+      for (auto copyOp : workspaceCopySeeds) {
           LDBG("Start from " << *copyOp.getOperation());
           llvm::SmallPtrSet<Operation *, 32> visited;
-          if (visitGroupOfOps(copyOp, [&](Operation *op) {
+          visitGroupOfOps(copyOp, [&](Operation *op) {
+                // Reused local buffers must stay in the parent loop so they
+                // dominate every C/V scope that reads or writes the same storage.
+                // Treat them as def-chain boundaries during grouping; otherwise
+                // their use lists can connect otherwise independent seed trees.
+                if (sharedAllocOps.contains(op))
+                  return true;
                 auto it = opGroupId.find(op);
                 if (it == opGroupId.end()) {
                   opGroupId[op] = groupId;
@@ -65,17 +95,17 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
                 }
                 return it->second != groupId;
               },
-                              visited))
-            break;
+                              visited);
           groupId++;
-          break;
-        }
+      }
 
       SmallVector<hivm::TCoreType> coreType(groupId,
                                             hivm::TCoreType::CUBE_OR_VECTOR);
       SmallVector<SmallVector<Operation *>> groups(groupId);
       SmallVector<std::vector<Mapper>> groupResults(groupId);
       for (auto &op : body->getOperations()) {
+        if (sharedAllocOps.contains(&op))
+          continue;
         if (opGroupId.find(&op) == opGroupId.end())
           continue;
         const auto id = opGroupId[&op];
@@ -156,18 +186,55 @@ private:
     return false;
   }
 
-  bool visitGroupOfOps(Operation *op,
+  void collectLocalAllocsFromCopy(
+      CopyOpInterface copyOp, llvm::SmallPtrSetImpl<Operation *> &allocs) {
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    for (auto val : {copyOp.getSource(), copyOp.getTarget()}) {
+      if (isValFromWorkspace(val))
+        continue;
+      auto definingOp = val.getDefiningOp();
+      if (!definingOp)
+        continue;
+      collectLocalAllocsFromDefChain(definingOp, allocs, visited);
+    }
+  }
+
+  void collectLocalAllocsFromDefChain(
+      Operation *op, llvm::SmallPtrSetImpl<Operation *> &allocs,
+      llvm::SmallPtrSetImpl<Operation *> &visited) {
+    if (!getTopLevelOpInCurrentFor(op))
+      return;
+    if (!visited.insert(op).second)
+      return;
+    if (isa<bishengir::memref_ext::AllocWorkspaceOp>(op))
+      return;
+    if (isa<memref::AllocOp>(op)) {
+      allocs.insert(op);
+      return;
+    }
+
+    for (auto operand : op->getOperands()) {
+      auto definingOp = operand.getDefiningOp();
+      if (!definingOp)
+        continue;
+      if (isScalarOp(definingOp))
+        continue;
+      collectLocalAllocsFromDefChain(definingOp, allocs, visited);
+    }
+  }
+
+  void visitGroupOfOps(Operation *op,
                        llvm::function_ref<bool(Operation *)> visitor,
                        llvm::SmallPtrSetImpl<Operation *> &visited) {
     Operation *scopeUnit = getTopLevelOpInCurrentFor(op);
     if (!scopeUnit)
-      return false;
+      return;
     if (!visited.insert(scopeUnit).second)
-      return false;
+      return;
     if (touchesMarkedLocalBoundary(scopeUnit))
-      return false;
+      return;
     if (visitor(scopeUnit))
-      return true;
+      return;
     LDBG("Visiting " << *op);
 
     for (auto user : op->getUsers()) {
@@ -175,8 +242,7 @@ private:
         continue;
       if (isa<scf::YieldOp>(user))
         continue;
-      if (visitGroupOfOps(user, visitor, visited))
-        return true;
+      visitGroupOfOps(user, visitor, visited);
     }
 
     for (auto operand : op->getOperands()) {
@@ -186,11 +252,8 @@ private:
       if (isScalarOp(definingOp) ||
           isa<bishengir::memref_ext::AllocWorkspaceOp>(definingOp))
         continue;
-      if (visitGroupOfOps(definingOp, visitor, visited))
-        return true;
+      visitGroupOfOps(definingOp, visitor, visited);
     }
-
-    return false;
   }
 
   Operation *getTopLevelOpInCurrentFor(Operation *op) {
