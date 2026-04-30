@@ -70,6 +70,8 @@ def sparse_attn_mix_kernel(
             value_min = -T.infinity(accum_dtype)
 
             # Cube 侧本地 tile：q_shared/kv_shared 进入 QK 和 PV 两次 GEMM。
+            # kv_shared 在本轮 top-k 块内由第一段 Cube 从 workspace 回灌，
+            # 第二段 Cube 直接复用这份 L1 数据，避免重复搬运同一块 KV。
             q_shared = T.alloc_shared((block_heads, dim), dtype)
             kv_shared = T.alloc_shared((block_top_k, dim), dtype)
             prob_shared = T.alloc_shared((block_heads, block_top_k), dtype)
@@ -196,7 +198,7 @@ def sparse_attn_mix_kernel(
                     # 形状上等价于：
                     # [block_heads, block_top_k] @ [block_top_k, dim] -> [block_heads, dim]。
                     T.copy(workspace_prob, prob_shared, size=[block_heads, block_top_k])
-                    T.copy(workspace_kv, kv_shared, size=[block_top_k, dim])
+                    # kv_shared 已在 QK 阶段从 workspace_kv 回灌，本阶段直接复用。
                     T.gemm(
                         prob_shared,
                         kv_shared,
