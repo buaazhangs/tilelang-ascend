@@ -75,23 +75,8 @@ private:
     return name == "hivm.hir.mmadL1" || name.contains("mmad");
   }
 
-  bool hasOnlyScalarResults(Operation *op) {
-    auto isScalar = [](Value val) {
-      return !isa<TensorType, BaseMemRefType, VectorType>(val.getType());
-    };
-    return op->getNumResults() > 0 && llvm::all_of(op->getResults(), isScalar);
-  }
-
-  // helper op 没有独立 C/V 含义，并且后续 EnableMultiBuffer 目前不会替换
-  // scope result，所以这些 op 先留在父 loop 中支配后续 scope。
-  bool isHelperOp(Operation *op) {
-    return isa<ViewLikeOpInterface>(op) || isScalarOp(op) ||
-           hasOnlyScalarResults(op);
-  }
-
   bool shouldKeepOutsideScope(Operation *op) {
-    return isa<memref::AllocOp, bishengir::memref_ext::AllocWorkspaceOp>(op) ||
-           isHelperOp(op) || op->getNumResults() != 0;
+    return isa<memref::AllocOp, bishengir::memref_ext::AllocWorkspaceOp>(op);
   }
 
   bool containsOp(const StageGroup &group, Operation *op) {
@@ -237,7 +222,11 @@ private:
         continue;
       }
 
-      if (shouldKeepOutsideScope(&op)) {
+      Operation *nextCubeOp = findNextCubeOpAfter(&op, cubeGroupOfOp);
+      llvm::SmallPtrSet<Operation *, 8> escapingVisited;
+      if (shouldKeepOutsideScope(&op) ||
+          hasResultEscapingVectorSegment(&op, nextCubeOp, cubeGroupOfOp,
+                                         escapingVisited)) {
         flushVector();
         continue;
       }
@@ -247,6 +236,52 @@ private:
 
     flushVector();
     return orderedGroups;
+  }
+
+  Operation *findNextCubeOpAfter(
+      Operation *op, const DenseMap<Operation *, std::size_t> &cubeGroupOfOp) {
+    bool seenOp = false;
+    for (auto &candidate : currentForOp.getBody()->getOperations()) {
+      if (&candidate == op) {
+        seenOp = true;
+        continue;
+      }
+      if (!seenOp)
+        continue;
+      if (cubeGroupOfOp.find(&candidate) != cubeGroupOfOp.end())
+        return &candidate;
+    }
+    return nullptr;
+  }
+
+  // arith/subview/reinterpret_cast 这类 helper 可以进入 scope，但前提是结果只在
+  // 当前 Vector 段内使用。若结果跨过下一个 Cube 段，或直接被 Cube 段使用，
+  // 就先留在父 loop 中，避免生成 EnableMultiBuffer 目前不会消解的 scope result。
+  // 这里递归检查 user 的结果是否逃逸，保证跨 stage 标量的 producer 链也留在外面。
+  bool hasResultEscapingVectorSegment(
+      Operation *op, Operation *nextCubeOp,
+      const DenseMap<Operation *, std::size_t> &cubeGroupOfOp,
+      llvm::SmallPtrSetImpl<Operation *> &visited) {
+    if (!visited.insert(op).second)
+      return false;
+
+    for (OpResult result : op->getResults()) {
+      for (auto &use : result.getUses()) {
+        Operation *user = getTopLevelOpInCurrentFor(use.getOwner());
+        if (!user)
+          return true;
+        if (user == op)
+          continue;
+        if (cubeGroupOfOp.find(user) != cubeGroupOfOp.end())
+          return true;
+        if (nextCubeOp && !user->isBeforeInBlock(nextCubeOp))
+          return true;
+        if (hasResultEscapingVectorSegment(user, nextCubeOp, cubeGroupOfOp,
+                                           visited))
+          return true;
+      }
+    }
+    return false;
   }
 
   // 在每组第一个 op 的原位置创建 scope，再按原序搬入组内 op。这样既保持 C/V stage
@@ -315,17 +350,6 @@ private:
                .Default(false);
   }
 
-  // 纯 scalar op 不携带 tensor/memref/vector 数据，当前先留在父 loop 中，
-  // 避免生成 EnableMultiBuffer 尚未处理的 scope result。
-  bool isScalarOp(Operation *op) {
-    if (op->getNumRegions() != 0 || op->getNumResults() == 0)
-      return false;
-    auto isScalar = [](Value val) {
-      return !isa<TensorType, BaseMemRefType, VectorType>(val.getType());
-    };
-    return llvm::all_of(op->getOperands(), isScalar) &&
-           llvm::all_of(op->getResults(), isScalar);
-  }
 };
 #undef DEBUG_TYPE
 
