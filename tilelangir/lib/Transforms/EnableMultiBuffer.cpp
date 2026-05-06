@@ -483,8 +483,8 @@ private:
           }
         }
         if (!isWorkspace) {
-          // 非 workspace 的 subview，可能需要替换偏移量
-          adjustGlobalSubviewOffset(subview, addI32, builder);
+          // 非 workspace 的 subview 在原位重写，避免把依赖当前 scope 内标量的 subview 提前到 loop 头部。
+          adjustGlobalSubviewOffset(subview, addI32, addIdx);
         }
       }
       else if (auto copyOp = dyn_cast<memref::CopyOp>(&op)) {
@@ -499,17 +499,20 @@ private:
     
     // 处理 workspace 的 subview（需要添加 stage 维度并 collapse shape）
     for (auto subview : workspaceSubviews) {
-      adjustWorkspaceSubviewOp(subview, indexIv, builder, addI32, numStage);
+      adjustWorkspaceSubviewOp(subview, indexIv, addI32, numStage);
     }
     // 处理 copy 操作（涉及 workspace 的）
     for (auto copyOp : copiesToAdjust) {
-      adjustCopyOp(copyOp, indexIv, builder, copyOp.getSource() == workspaceValues_[0] /* simplified */, copyOp.getTarget() == workspaceValues_[0], addI32, numStage);
+      adjustCopyOp(copyOp, indexIv, copyOp.getSource() == workspaceValues_[0] /* simplified */, copyOp.getTarget() == workspaceValues_[0], addI32, numStage);
     }
   }
   
-  void adjustWorkspaceSubviewOp(memref::SubViewOp subview, Value indexIv, OpBuilder &builder,
+  void adjustWorkspaceSubviewOp(memref::SubViewOp subview, Value indexIv,
                                 Value addI32, int32_t numStage) {
     Location loc = subview.getLoc();
+    // 在原 subview 位置插入替换 op。这样既不会复用可能被 erase 掉的固定插入点，
+    // 也不会把 subview 提前到其 offset/size 依赖的标量计算之前。
+    OpBuilder builder(subview);
     Value source = subview.getSource();
     auto currentSourceType = source.getType().cast<MemRefType>();
     
@@ -562,31 +565,41 @@ private:
     subview.erase();
   }
   
-  void adjustGlobalSubviewOffset(memref::SubViewOp subview, Value addI32, OpBuilder &builder) {
+  void adjustGlobalSubviewOffset(memref::SubViewOp subview, Value addI32, Value addIdx) {
     Location loc = subview.getLoc();
+    // 非 workspace subview 也必须原位重写，否则 top-k 这类动态 offset/size
+    // 依赖当前 scope/loop 内标量时会被提前到定义之前。
+    OpBuilder builder(subview);
     auto origOffsets = subview.getMixedOffsets();
     auto origSizes = subview.getMixedSizes();
     auto origStrides = subview.getMixedStrides();
-    
+
     SmallVector<OpFoldResult> newOffsets;
+    bool changed = false;
     for (size_t i = 0; i < origOffsets.size(); ++i) {
       auto ofr = origOffsets[i];
       if (auto val = ofr.dyn_cast<Value>()) {
         auto factor = getIndexFactor(val, outerIV_);
         if (factor.has_value()) {
+          changed = true;
           if (*factor == 1) {
-            newOffsets.push_back(addI32);
+            newOffsets.push_back(val.getType().isIndex() ? addIdx : addI32);
           } else {
             Value constFactor = builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(*factor));
             Value newI32 = builder.create<arith::MulIOp>(loc, addI32, constFactor);
-            Value newIdx = builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), newI32);
-            newOffsets.push_back(newIdx);
+            if (val.getType().isIndex()) {
+              Value newIdx = builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), newI32);
+              newOffsets.push_back(newIdx);
+            } else {
+              newOffsets.push_back(newI32);
+            }
           }
           continue;
         }
       }
       newOffsets.push_back(ofr);
     }
+    if (!changed) return;
     
     // 创建新的 subview，结果类型由 MLIR 自动推导
     auto newSubview = builder.create<memref::SubViewOp>(
@@ -595,9 +608,11 @@ private:
     subview.erase();
   }
   
-  void adjustCopyOp(memref::CopyOp copyOp, Value indexIv, OpBuilder &builder,
+  void adjustCopyOp(memref::CopyOp copyOp, Value indexIv,
                     bool fixSource, bool fixTarget, Value addI32, int32_t numStage) {
     Location loc = copyOp.getLoc();
+    // 直接使用 workspace 的 copy 也按原 copy 位置重写，避免固定插入点失效。
+    OpBuilder builder(copyOp);
     
     Value ws = nullptr;
     for (Value candidate : workspaceValues_) {
