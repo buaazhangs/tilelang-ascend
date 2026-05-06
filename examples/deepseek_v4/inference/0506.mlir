@@ -221,4 +221,3 @@ module attributes {hivm.module_core_type = #hivm.module_core_type<AIC>, memref.m
     return
   }
 }
-
