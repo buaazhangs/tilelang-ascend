@@ -40,8 +40,6 @@ namespace tilelangir {
 #define GEN_PASS_DEF_TILELANGIRENABLEMULTIBUFFER
 #include "tilelangir/Transforms/Passes.h.inc"
 
-static int g_subviewProcessedCount = 0;
-
 static void debugPrintType(StringRef msg, Type type) {
   LLVM_DEBUG({
     std::string str;
@@ -334,9 +332,10 @@ public:
     adjustOperationsInLoop(newFor, addI32, addIdx, numStage_);
     
     // 处理外层循环体中定义的、被内层循环体使用的比较操作
-    handleOuterCmpOps(newFor, newBody, addI32, builder, loc);
+    handleOuterCmpOps(newFor, newBody, addI32, addIdx, builder, loc);
     
-    // 替换新循环体内所有对 outerIV_ 的使用为 addIdx，但跳过我们刚刚创建的操作本身
+    // 替换新循环体内所有对 outerIV_ 的使用。i32 operand 使用 addI32，
+    // index operand 使用 addIdx，避免把 i32 算术改成 index/i32 混用。
     Operation *mulOp = mul.getDefiningOp();
     Operation *addOp = addI32.getDefiningOp();
     Operation *idxCastOp = addIdx.getDefiningOp();
@@ -344,7 +343,8 @@ public:
       if (&op == mulOp || &op == addOp || &op == idxCastOp) continue;
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         if (op.getOperand(i) == outerIV_) {
-          op.setOperand(i, addIdx);
+          Value replacement = op.getOperand(i).getType().isIndex() ? addIdx : addI32;
+          op.setOperand(i, replacement);
         }
       }
     }
@@ -399,7 +399,7 @@ private:
     return std::nullopt;
   }
   
-  void handleOuterCmpOps(scf::ForOp innerFor, Block *innerBody, Value addI32, OpBuilder &builder, Location loc) {
+  void handleOuterCmpOps(scf::ForOp innerFor, Block *innerBody, Value addI32, Value addIdx, OpBuilder &builder, Location loc) {
     Block *outerBlock = innerFor->getBlock();
     SmallVector<arith::CmpIOp> cmpsToClone;
     for (Operation &op : *outerBlock) {
@@ -435,7 +435,7 @@ private:
         auto factor = getIndexFactor(operand, outerIV_);
         if (factor.has_value()) {
           if (*factor == 1) {
-            newOperands.push_back(addI32);
+            newOperands.push_back(operand.getType().isIndex() ? addIdx : addI32);
           } else {
             Value constFactor = builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(*factor));
             Value newI32 = builder.create<arith::MulIOp>(loc, addI32, constFactor);
@@ -740,7 +740,6 @@ void TileLangIREnableMultiBuffer::runOnOperation() {
   if (!module) return;
   
   LLVM_DEBUG(DBGS() << "Starting EnableMultiBuffer pass\n");
-  g_subviewProcessedCount = 0;
   
   if (!WorkspaceExpander::expand(module)) {
     LLVM_DEBUG(DBGS() << "No workspaces to expand.\n");
@@ -790,11 +789,6 @@ void TileLangIREnableMultiBuffer::runOnOperation() {
     });
   }
   
-  LLVM_DEBUG(DBGS() << "Total SubViews processed: " << g_subviewProcessedCount << "\n");
-  if (g_subviewProcessedCount != 6) {
-    llvm::errs() << "WARNING: Expected 6 subviews to be processed, but got " << g_subviewProcessedCount << ".\n";
-    llvm::errs() << "This implies some subviews were skipped or the pass crashed early.\n";
-  }
 }
 
 } // namespace tilelangir
