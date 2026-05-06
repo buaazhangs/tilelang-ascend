@@ -98,16 +98,16 @@ def sparse_attn_mix_kernel(
             # workspace 是 Cube/Vector 边界的 GM 中转区，也是 mix pass 做
             # multi-buffer 扩展和自动 set/wait 同步的锚点。
             workspace_kv = T.alloc_workspace(
-                (block_top_k, dim), dtype, multi_buffer=multibuffer
+                (2,block_top_k, dim), dtype, multi_buffer=multibuffer
             )
             workspace_score = T.alloc_workspace(
-                (block_heads, block_top_k), accum_dtype, multi_buffer=multibuffer
+                (2,block_heads, block_top_k), accum_dtype, multi_buffer=multibuffer
             )
             workspace_prob = T.alloc_workspace(
-                (block_heads, block_top_k), dtype, multi_buffer=multibuffer
+                (2,block_heads, block_top_k), dtype, multi_buffer=multibuffer
             )
             workspace_out = T.alloc_workspace(
-                (block_heads, dim), accum_dtype, multi_buffer=multibuffer
+                (2,block_heads, dim), accum_dtype, multi_buffer=multibuffer
             )
 
             # 外层按 head block 遍历。这里必须是普通 serial loop，当前 mix pass
@@ -146,13 +146,13 @@ def sparse_attn_mix_kernel(
                             mask_ub[0, i] = 1.0
                             T.copy(KV[by, cur_idx, 0], kv_ub[i, 0], size=[1, dim])
 
-                    T.copy(kv_ub, workspace_kv, size=[block_top_k, dim])
+                    T.copy(kv_ub, workspace_kv[0,0, 0], size=[block_top_k, dim])
 
                     # Cube 阶段 1：从 workspace 回灌 KV 到 L1，计算
                     # scores = Q * K^T，得到 block_heads x block_top_k 的分数。
                     # 形状上等价于：
                     # [block_heads, dim] @ [dim, block_top_k] -> [block_heads, block_top_k]。
-                    T.copy(workspace_kv, kv_shared, size=[block_top_k, dim])
+                    T.copy(workspace_kv[0,0, 0], kv_shared, size=[block_top_k, dim])
                     T.gemm(
                         q_shared,
                         kv_shared,
@@ -161,12 +161,12 @@ def sparse_attn_mix_kernel(
                         b_transpose=True,
                         size=[block_heads, dim, block_top_k],
                     )
-                    T.copy(scores, workspace_score, size=[block_heads, block_top_k])
+                    T.copy(scores, workspace_score[0,0, 0], size=[block_heads, block_top_k])
 
                     # Vector 阶段 2：每个 vid 只处理一半 heads。这里做在线
                     # softmax：维护历史 max/sum，并把本块概率写回 workspace。
                     T.copy(
-                        workspace_score[vid * block_heads_half, 0],
+                        workspace_score[0,vid * block_heads_half, 0],
                         scores_ub,
                         size=[block_heads_half, block_top_k],
                     )
@@ -189,7 +189,7 @@ def sparse_attn_mix_kernel(
                     T.vcast(scores_ub, scores_cast, round_mode="rint")
                     T.copy(
                         scores_cast,
-                        workspace_prob[vid * block_heads_half, 0],
+                        workspace_prob[0,vid * block_heads_half, 0],
                         size=[block_heads_half, block_top_k],
                     )
 
@@ -197,7 +197,7 @@ def sparse_attn_mix_kernel(
                     # P * V，输出完整 block_heads 的本块贡献到 workspace_out。
                     # 形状上等价于：
                     # [block_heads, block_top_k] @ [block_top_k, dim] -> [block_heads, dim]。
-                    T.copy(workspace_prob, prob_shared, size=[block_heads, block_top_k])
+                    T.copy(workspace_prob[0,0, 0], prob_shared, size=[block_heads, block_top_k])
                     # kv_shared 已在 QK 阶段从 workspace_kv 回灌，本阶段直接复用。
                     T.gemm(
                         prob_shared,
@@ -206,12 +206,12 @@ def sparse_attn_mix_kernel(
                         initC=True,
                         size=[block_heads, block_top_k, dim],
                     )
-                    T.copy(pv_acc, workspace_out, size=[block_heads, dim])
+                    T.copy(pv_acc, workspace_out[0,0, 0], size=[block_heads, dim])
 
                     # Vector 阶段 3：取自己负责的 half-head 输出块，结合
                     # online softmax 的 scale 修正历史累加结果。
                     T.copy(
-                        workspace_out[vid * block_heads_half, 0],
+                        workspace_out[0,vid * block_heads_half, 0],
                         acc_o_new,
                         size=[block_heads_half, dim],
                     )
