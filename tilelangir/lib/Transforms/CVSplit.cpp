@@ -92,6 +92,42 @@ private:
     group.ops.push_back(op);
   }
 
+  // copy 的 source/target 可能不是 workspace 本身，而是
+  // workspace 上的 subview/reinterpret_cast/collapse_shape 等 view。
+  // 这些 view producer 和 copy 是同一个 C/V 边界的一部分，必须一起进 scope；
+  // 否则 copy 被搬入 scope 后会使用仍留在父 region、甚至位于 scope 之后的 view。
+  void addViewProducerChainToGroup(StageGroup &group, Value value) {
+    llvm::SmallPtrSet<Operation *, 8> visited;
+    addViewProducerChainToGroup(group, value, visited);
+  }
+
+  void addViewProducerChainToGroup(
+      StageGroup &group, Value value,
+      llvm::SmallPtrSetImpl<Operation *> &visited) {
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp || !visited.insert(definingOp).second)
+      return;
+
+    auto viewOp = dyn_cast<ViewLikeOpInterface>(definingOp);
+    if (!viewOp)
+      return;
+
+    addViewProducerChainToGroup(group, viewOp.getViewSource(), visited);
+    addOpToGroup(group, definingOp);
+  }
+
+  void addBoundaryCopyToGroup(StageGroup &group, Operation *op) {
+    if (!op)
+      return;
+
+    auto copyOp = dyn_cast<CopyOpInterface>(op);
+    if (copyOp) {
+      addViewProducerChainToGroup(group, copyOp.getSource());
+      addViewProducerChainToGroup(group, copyOp.getTarget());
+    }
+    addOpToGroup(group, op);
+  }
+
   void sortGroupOps(StageGroup &group) {
     std::sort(group.ops.begin(), group.ops.end(),
               [](Operation *lhs, Operation *rhs) {
@@ -153,10 +189,12 @@ private:
       if (!localAlloc)
         continue;
 
-      addOpToGroup(group, findWorkspaceToLocalCopyBefore(anchor, localAlloc,
-                                                         alreadyInCube));
-      addOpToGroup(group, findLocalToWorkspaceCopyAfter(anchor, localAlloc,
-                                                       alreadyInCube));
+      addBoundaryCopyToGroup(
+          group, findWorkspaceToLocalCopyBefore(anchor, localAlloc,
+                                                alreadyInCube));
+      addBoundaryCopyToGroup(
+          group, findLocalToWorkspaceCopyAfter(anchor, localAlloc,
+                                               alreadyInCube));
     }
   }
 
