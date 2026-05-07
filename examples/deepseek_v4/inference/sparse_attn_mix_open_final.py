@@ -72,8 +72,10 @@ def sparse_attn_mix_kernel(
             # Cube 侧本地 tile：q_shared/kv_shared 进入 QK 和 PV 两次 GEMM。
             # kv_shared 在本轮 top-k 块内由第一段 Cube 从 workspace 回灌，
             # 第二段 Cube 直接复用这份 L1 数据，避免重复搬运同一块 KV。
+            # EnableMultiBuffer 会把 C1(s0,s1) 和 C2(s0,s1) 拆成两个 stage loop，
+            # 因此 kv_shared 必须按 stage 保留，否则 C2(s0) 会读到 C1(s1) 搬入的 KV。
             q_shared = T.alloc_shared((block_heads, dim), dtype)
-            kv_shared = T.alloc_shared((block_top_k, dim), dtype)
+            kv_shared = T.alloc_shared((block_top_k, dim), dtype, multi_buffer=multibuffer)
             prob_shared = T.alloc_shared((block_heads, block_top_k), dtype)
             scores = T.alloc_fragment((block_heads, block_top_k), accum_dtype)
             scores_cast = T.alloc_shared((block_heads_half, block_top_k), dtype)
@@ -82,13 +84,16 @@ def sparse_attn_mix_kernel(
             # Vector 侧本地 tile：负责 gather 稀疏 KV、mask、online softmax 和输出累加。
             kv_ub = T.alloc_shared((block_top_k, dim), dtype)
             idxs = T.alloc_fragment((block_top_k,), indices_dtype)
-            # mask 只在 Vector 侧参与 softmax，不作为 Cube 输入，因此保持 UB 常驻，
-            # 避免额外 workspace 搬运，也避免给 CVSplit 引入不必要的 seed。
-            mask_ub = T.alloc_shared((1, block_top_k), accum_dtype)
+            # mask_ub 由 V1 生成并在 V2 使用，是跨 Vector scope 的 per-stage 临时值；
+            # 它不是 scores_max/sum_exp/acc_o 这种跨 k 递推状态，因此需要 local multi-buffer。
+            mask_ub = T.alloc_shared((1, block_top_k), accum_dtype, multi_buffer=multibuffer)
             scores_ub = T.alloc_shared((block_heads_half, block_top_k), accum_dtype)
             scores_max = T.alloc_shared((block_heads_half, 1), accum_dtype)
             scores_max_prev = T.alloc_shared((block_heads_half, 1), accum_dtype)
-            scores_scale = T.alloc_shared((block_heads_half, 1), accum_dtype)
+            # scores_scale 由 V2 生成并在 V3 用于修正历史 acc_o，语义等价于 FA_mix 的 correction。
+            scores_scale = T.alloc_shared(
+                (block_heads_half, 1), accum_dtype, multi_buffer=multibuffer
+            )
             scores_sum = T.alloc_shared((block_heads_half, 1), accum_dtype)
             sum_exp = T.alloc_shared((block_heads_half, 1), accum_dtype)
             acc_o = T.alloc_shared((block_heads_half, dim), accum_dtype)
