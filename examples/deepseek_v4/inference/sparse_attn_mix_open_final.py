@@ -263,7 +263,7 @@ def sparse_attn(
     # - topk_idxs: [batch_size, seq_len, top_k]，每个 query token 对应的稀疏 KV 下标。
     # - softmax_scale: score 缩放因子，通常是 1/sqrt(dim)。
     block = 32
-    block_heads = 16
+    block_heads = 64
     multibuffer = 2
     # block 别名对应 kernel 里的 block_top_k；block_heads 对应 Q num_heads 维分块。
     # 当前配置下，Cube 每次处理 16 个 Q heads x 32 个 sparse KV tokens，
@@ -393,7 +393,7 @@ def generate_data():
         seq_len=256,
         seq_len_kv=256,
         top_k=128,
-        dim=512,
+        dim=32,
     )
 
 
