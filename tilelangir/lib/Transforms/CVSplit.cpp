@@ -9,6 +9,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMTraits.h"
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/MemRefExt/IR/MemRefExt.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -75,8 +76,13 @@ private:
     return name == "hivm.hir.mmadL1" || name.contains("mmad");
   }
 
+  // 声明和元数据不是实际的 C/V 执行语句，需要留在父 loop 中供多个 scope 捕获。
+  // 其中 annotation.mark 只描述 multi_buffer 等属性，若误放入 VECTOR scope，
+  // InferMemScope 会把被标记的 local buffer 当作 UB 使用，和真实 CUBE GEMM
+  // 的 L1 约束冲突。
   bool shouldKeepOutsideScope(Operation *op) {
-    return isa<memref::AllocOp, bishengir::memref_ext::AllocWorkspaceOp>(op);
+    return isa<memref::AllocOp, bishengir::memref_ext::AllocWorkspaceOp,
+               bishengir::annotation::MarkOp>(op);
   }
 
   bool containsOp(const StageGroup &group, Operation *op) {
@@ -260,10 +266,12 @@ private:
         continue;
       }
 
+      if (shouldKeepOutsideScope(&op))
+        continue;
+
       Operation *nextCubeOp = findNextCubeOpAfter(&op, cubeGroupOfOp);
       llvm::SmallPtrSet<Operation *, 8> escapingVisited;
-      if (shouldKeepOutsideScope(&op) ||
-          hasResultEscapingVectorSegment(&op, nextCubeOp, cubeGroupOfOp,
+      if (hasResultEscapingVectorSegment(&op, nextCubeOp, cubeGroupOfOp,
                                          escapingVisited)) {
         flushVector();
         continue;
