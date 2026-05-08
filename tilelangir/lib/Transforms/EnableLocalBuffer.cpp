@@ -139,6 +139,27 @@ static Value createSubviewAndCollapse(OpBuilder &builder, Location loc,
   return builder.create<memref::CollapseShapeOp>(loc, subviewOp.getResult(), reassociation);
 }
 
+static MemRefType rebuildSubviewResultType(memref::SubViewOp subviewOp,
+                                           MemRefType newSourceType) {
+  auto oldResultType = subviewOp.getResult().getType().cast<MemRefType>();
+  auto oldLayout = dyn_cast<StridedLayoutAttr>(oldResultType.getLayout());
+  auto newSourceLayout = dyn_cast<StridedLayoutAttr>(newSourceType.getLayout());
+  if (!oldLayout || !newSourceLayout)
+    return oldResultType;
+
+  int64_t offset = oldLayout.getOffset();
+  if (newSourceLayout.getOffset() == ShapedType::kDynamic)
+    offset = ShapedType::kDynamic;
+
+  SmallVector<int64_t> strides(oldLayout.getStrides().begin(),
+                               oldLayout.getStrides().end());
+  auto newLayout =
+      StridedLayoutAttr::get(oldResultType.getContext(), offset, strides);
+  return MemRefType::get(oldResultType.getShape(),
+                         oldResultType.getElementType(), newLayout,
+                         oldResultType.getMemorySpace());
+}
+
 static void replaceOperandWithSubview(Operation *user, memref::AllocOp allocOp,
                                       scf::ForOp stageLoop, int32_t multiBuffer) {
   OpBuilder builder(user);
@@ -158,10 +179,12 @@ static void replaceOperandWithSubview(Operation *user, memref::AllocOp allocOp,
     if (subviewOp.getSource() == allocOp.getResult()) {
       // 原 subview 的 source 被替换为 stage slice 后，source layout 会带动态
       // offset；如果只替换 operand，旧 subview result type 的静态 offset 会失效。
-      // 因此在原位重建 subview，让 MLIR 按新 source 重新推导 result type。
+      // 因此在原位重建 subview，并保留原 subview 的 rank-reduce 结果形状。
+      auto resultType = rebuildSubviewResultType(
+          subviewOp, collapsed.getType().cast<MemRefType>());
       auto newSubviewOp = builder.create<memref::SubViewOp>(
-          loc, collapsed, subviewOp.getMixedOffsets(), subviewOp.getMixedSizes(),
-          subviewOp.getMixedStrides());
+          loc, resultType, collapsed, subviewOp.getMixedOffsets(),
+          subviewOp.getMixedSizes(), subviewOp.getMixedStrides());
       subviewOp.getResult().replaceAllUsesWith(newSubviewOp.getResult());
       subviewOp.erase();
       return;
