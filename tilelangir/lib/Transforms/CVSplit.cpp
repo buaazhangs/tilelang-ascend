@@ -82,7 +82,7 @@ private:
   // 的 L1 约束冲突。
   bool shouldKeepOutsideScope(Operation *op) {
     return isa<memref::AllocOp, bishengir::memref_ext::AllocWorkspaceOp,
-               bishengir::annotation::MarkOp>(op);
+               annotation::MarkOp>(op);
   }
 
   bool containsOp(const StageGroup &group, Operation *op) {

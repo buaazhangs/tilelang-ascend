@@ -74,30 +74,35 @@ static std::optional<int32_t> getMultiBufferFromMark(Value value) {
   return std::nullopt;
 }
 
+static bool isStageLoop(scf::ForOp forOp, int32_t multiBuffer) {
+  Value upper = forOp.getUpperBound();
+  APInt upperInt;
+  if (!matchPattern(upper, m_ConstantInt(&upperInt)))
+    return false;
+  if (upperInt.getZExtValue() != static_cast<uint64_t>(multiBuffer))
+    return false;
+
+  Value step = forOp.getStep();
+  APInt stepInt;
+  if (!matchPattern(step, m_ConstantInt(&stepInt)) || stepInt != 1)
+    return false;
+
+  Operation *parent = forOp->getParentOp();
+  while (parent && !isa<scf::ForOp>(parent))
+    parent = parent->getParentOp();
+  auto outerFor = dyn_cast_or_null<scf::ForOp>(parent);
+  return outerFor && outerFor->hasAttr("tilelangir.num_stages");
+}
+
 static scf::ForOp findStageLoop(Operation *op, int32_t multiBuffer) {
-  Operation *curr = op;
-  while (curr) {
+  // local multi-buffer 的真实 stage loop 是 EnableMultiBuffer 在 pipeline
+  // 循环内部生成的 for。user 可能嵌在 top-k/gather 的动态 scf.for 或
+  // scf.if 里，因此不能在第一个不匹配的 scf.for 处停止，必须继续向外找。
+  for (Operation *curr = op; curr; curr = curr->getParentOp()) {
     if (auto forOp = dyn_cast<scf::ForOp>(curr)) {
-      Value upper = forOp.getUpperBound();
-      APInt upperInt;
-      if (!matchPattern(upper, m_ConstantInt(&upperInt)))
-        break;
-      if (upperInt.getZExtValue() != static_cast<uint64_t>(multiBuffer))
-        break;
-      Value step = forOp.getStep();
-      APInt stepInt;
-      if (!matchPattern(step, m_ConstantInt(&stepInt)) || stepInt != 1)
-        break;
-      Operation *parent = forOp->getParentOp();
-      while (parent && !isa<scf::ForOp>(parent))
-        parent = parent->getParentOp();
-      if (auto outerFor = dyn_cast_or_null<scf::ForOp>(parent)) {
-        if (outerFor->hasAttr("tilelangir.num_stages"))
-          return forOp;
-      }
-      break;
+      if (isStageLoop(forOp, multiBuffer))
+        return forOp;
     }
-    curr = curr->getParentOp();
   }
   return nullptr;
 }
