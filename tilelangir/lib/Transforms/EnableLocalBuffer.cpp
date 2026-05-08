@@ -154,6 +154,20 @@ static void replaceOperandWithSubview(Operation *user, memref::AllocOp allocOp,
   MemRefType allocType = allocOp.getType().cast<MemRefType>();
   Value collapsed = createSubviewAndCollapse(builder, loc, allocOp, allocType, idx);
 
+  if (auto subviewOp = dyn_cast<memref::SubViewOp>(user)) {
+    if (subviewOp.getSource() == allocOp.getResult()) {
+      // 原 subview 的 source 被替换为 stage slice 后，source layout 会带动态
+      // offset；如果只替换 operand，旧 subview result type 的静态 offset 会失效。
+      // 因此在原位重建 subview，让 MLIR 按新 source 重新推导 result type。
+      auto newSubviewOp = builder.create<memref::SubViewOp>(
+          loc, collapsed, subviewOp.getMixedOffsets(), subviewOp.getMixedSizes(),
+          subviewOp.getMixedStrides());
+      subviewOp.getResult().replaceAllUsesWith(newSubviewOp.getResult());
+      subviewOp.erase();
+      return;
+    }
+  }
+
   for (OpOperand &operand : user->getOpOperands()) {
     if (operand.get() == allocOp) {
       operand.set(collapsed);
