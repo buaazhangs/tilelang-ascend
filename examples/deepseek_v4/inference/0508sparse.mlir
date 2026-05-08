@@ -1,4 +1,4 @@
-2026-05-08 10:55:39  [TileLang:tilelang.env:WARNING]: Loading tilelang libs from dev root: /home/z00910011/tilelang-ascend-test/tilelang-ascend/build
+2026-05-08 11:40:13  [TileLang:tilelang.env:WARNING]: Loading tilelang libs from dev root: /home/z00910011/tilelang-ascend-test/tilelang-ascend/build
 Warning: The current version of the file storing weights is old, and it is relanded due to internal bug of torch and compatibility issue. We will deprecate the loading support for this type of file in the future, please use newer torch to re-store the weight file.
 ====== TVM IR ======
 # from tvm.script import ir as I
@@ -2161,7 +2161,7 @@ module attributes {hivm.module_core_type = #hivm.module_core_type<AIC>, memref.m
 }
 
 
-loc("input.mlir":170:23): error: expected result type to be 'memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>' or a rank-reduced version. (mismatch of result layout) 
+loc("input.mlir":172:9): error: 'memref.copy' op requires the same shape for all operands
 // -----// IR Dump After TileLangIREnableLocalBuffer Failed (tilelangir-enable-local-buffer) ('builtin.module' operation) //----- //
 "builtin.module"() ({
   "func.func"() <{arg_attrs = [{hacc.arg_type = #hacc.arg_type<ffts_base_address>}, {}, {hacc.arg_type = #hacc.arg_type<workspace>}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}], function_type = (i64, memref<?xi8, #hivm.address_space<gm>>, memref<?xi8, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xf32, #hivm.address_space<gm>>, memref<?xi32, #hivm.address_space<gm>>, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> (), sym_name = "sparseAttnMix"}> ({
@@ -2377,9 +2377,9 @@ loc("input.mlir":170:23): error: expected result type to be 'memref<1x32xf32, st
           %159 = "arith.index_cast"(%arg23) : (i32) -> index
           %160 = "memref.subview"(%94, %159) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0, 0>, static_sizes = array<i64: 1, 1, 32>, static_strides = array<i64: 1, 1, 1>}> : (memref<2x1x32xf32, strided<[32, 32, 1]>, #hivm.address_space<ub>>, index) -> memref<1x1x32xf32, strided<[32, 32, 1], offset: ?>, #hivm.address_space<ub>>
           %161 = "memref.collapse_shape"(%160) <{reassociation = [[0, 1], [2]]}> : (memref<1x1x32xf32, strided<[32, 32, 1], offset: ?>, #hivm.address_space<ub>>) -> memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>
-          %162 = "memref.subview"(%161) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>) -> memref<32xf32, strided<[1]>, #hivm.address_space<ub>>
+          %162 = "memref.subview"(%161) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>) -> memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>
           %163 = "memref.subview"(%103) <{operandSegmentSizes = array<i32: 1, 0, 0, 0>, static_offsets = array<i64: 0, 0>, static_sizes = array<i64: 1, 32>, static_strides = array<i64: 1, 1>}> : (memref<1x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>) -> memref<32xf32, strided<[1]>, #hivm.address_space<ub>>
-          "memref.copy"(%162, %163) : (memref<32xf32, strided<[1]>, #hivm.address_space<ub>>, memref<32xf32, strided<[1]>, #hivm.address_space<ub>>) -> ()
+          "memref.copy"(%162, %163) : (memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>, memref<32xf32, strided<[1]>, #hivm.address_space<ub>>) -> ()
           "hivm.hir.vbrc"(%103, %104) <{broadcast_dims = array<i64: 0>}> : (memref<1x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>, memref<8x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>) -> ()
           "hivm.hir.vmul"(%95, %104, %95) <{broadcast = array<i64>, operandSegmentSizes = array<i32: 2, 1, 0>, transpose = array<i64>}> : (memref<8x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>, memref<8x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>, memref<8x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>) -> ()
           "hivm.hir.vreduce"(%95, %97) <{arith = #hivm.reduce_op<sum>, operandSegmentSizes = array<i32: 1, 1, 0, 0>, reduce_dims = array<i64: 1>}> : (memref<8x32xf32, strided<[32, 1]>, #hivm.address_space<ub>>, memref<8x1xf32, strided<[1, 1]>, #hivm.address_space<ub>>) -> ()
@@ -2508,4 +2508,4 @@ Traceback (most recent call last):
     return self._pp.run(mlir_str)
            ^^^^^^^^^^^^^^^^^^^^^^
 RuntimeError: Pass pipeline run failed
-[ERROR] 2026-05-08-10:55:43 (PID:2271438, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+[ERROR] 2026-05-08-11:40:18 (PID:2468391, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
