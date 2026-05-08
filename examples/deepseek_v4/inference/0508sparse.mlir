@@ -1,4 +1,4 @@
-2026-05-08 10:07:12  [TileLang:tilelang.env:WARNING]: Loading tilelang libs from dev root: /home/z00910011/tilelang-ascend-test/tilelang-ascend/build
+2026-05-08 10:55:39  [TileLang:tilelang.env:WARNING]: Loading tilelang libs from dev root: /home/z00910011/tilelang-ascend-test/tilelang-ascend/build
 Warning: The current version of the file storing weights is old, and it is relanded due to internal bug of torch and compatibility issue. We will deprecate the loading support for this type of file in the future, please use newer torch to re-store the weight file.
 ====== TVM IR ======
 # from tvm.script import ir as I
@@ -2161,7 +2161,7 @@ module attributes {hivm.module_core_type = #hivm.module_core_type<AIC>, memref.m
 }
 
 
-loc("input.mlir":128:13): error: 'memref.store' op store index operand count not equal to memref rank
+loc("input.mlir":170:23): error: expected result type to be 'memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>' or a rank-reduced version. (mismatch of result layout) 
 // -----// IR Dump After TileLangIREnableLocalBuffer Failed (tilelangir-enable-local-buffer) ('builtin.module' operation) //----- //
 "builtin.module"() ({
   "func.func"() <{arg_attrs = [{hacc.arg_type = #hacc.arg_type<ffts_base_address>}, {}, {hacc.arg_type = #hacc.arg_type<workspace>}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}], function_type = (i64, memref<?xi8, #hivm.address_space<gm>>, memref<?xi8, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xbf16, #hivm.address_space<gm>>, memref<?xf32, #hivm.address_space<gm>>, memref<?xi32, #hivm.address_space<gm>>, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> (), sym_name = "sparseAttnMix"}> ({
@@ -2298,13 +2298,16 @@ loc("input.mlir":128:13): error: 'memref.store' op store index operand count not
             %210 = "arith.cmpi"(%209, %14) <{predicate = 1 : i64}> : (i32, i32) -> i1
             "scf.if"(%210) ({
               %211 = "arith.index_cast"(%arg26) : (i32) -> index
-              "memref.store"(%13, %94, %2, %211) : (f32, memref<2x1x32xf32, strided<[32, 32, 1]>, #hivm.address_space<ub>>, index, index) -> ()
-              %212 = "arith.divsi"(%41, %arg9) : (i32, i32) -> i32
-              %213 = "arith.index_cast"(%212) : (i32) -> index
-              %214 = "arith.index_cast"(%209) : (i32) -> index
-              %215 = "memref.subview"(%38, %213, %214) <{operandSegmentSizes = array<i32: 1, 2, 0, 0>, static_offsets = array<i64: -9223372036854775808, -9223372036854775808, 0>, static_sizes = array<i64: 1, 1, 512>, static_strides = array<i64: 1, 1, 1>}> : (memref<?x?x512xbf16, strided<[?, ?, ?]>, #hivm.address_space<gm>>, index, index) -> memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>
-              %216 = "memref.subview"(%92, %211) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 1, 512>, static_strides = array<i64: 1, 1>}> : (memref<32x512xbf16, strided<[512, 1]>, #hivm.address_space<ub>>, index) -> memref<512xbf16, strided<[1], offset: ?>, #hivm.address_space<ub>>
-              "memref.copy"(%215, %216) : (memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>, memref<512xbf16, strided<[1], offset: ?>, #hivm.address_space<ub>>) -> ()
+              %212 = "arith.index_cast"(%arg25) : (i32) -> index
+              %213 = "memref.subview"(%94, %212) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0, 0>, static_sizes = array<i64: 1, 1, 32>, static_strides = array<i64: 1, 1, 1>}> : (memref<2x1x32xf32, strided<[32, 32, 1]>, #hivm.address_space<ub>>, index) -> memref<1x1x32xf32, strided<[32, 32, 1], offset: ?>, #hivm.address_space<ub>>
+              %214 = "memref.collapse_shape"(%213) <{reassociation = [[0, 1], [2]]}> : (memref<1x1x32xf32, strided<[32, 32, 1], offset: ?>, #hivm.address_space<ub>>) -> memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>
+              "memref.store"(%13, %214, %2, %211) : (f32, memref<1x32xf32, strided<[32, 1], offset: ?>, #hivm.address_space<ub>>, index, index) -> ()
+              %215 = "arith.divsi"(%41, %arg9) : (i32, i32) -> i32
+              %216 = "arith.index_cast"(%215) : (i32) -> index
+              %217 = "arith.index_cast"(%209) : (i32) -> index
+              %218 = "memref.subview"(%38, %216, %217) <{operandSegmentSizes = array<i32: 1, 2, 0, 0>, static_offsets = array<i64: -9223372036854775808, -9223372036854775808, 0>, static_sizes = array<i64: 1, 1, 512>, static_strides = array<i64: 1, 1, 1>}> : (memref<?x?x512xbf16, strided<[?, ?, ?]>, #hivm.address_space<gm>>, index, index) -> memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>
+              %219 = "memref.subview"(%92, %211) <{operandSegmentSizes = array<i32: 1, 1, 0, 0>, static_offsets = array<i64: -9223372036854775808, 0>, static_sizes = array<i64: 1, 512>, static_strides = array<i64: 1, 1>}> : (memref<32x512xbf16, strided<[512, 1]>, #hivm.address_space<ub>>, index) -> memref<512xbf16, strided<[1], offset: ?>, #hivm.address_space<ub>>
+              "memref.copy"(%218, %219) : (memref<512xbf16, strided<[?], offset: ?>, #hivm.address_space<gm>>, memref<512xbf16, strided<[1], offset: ?>, #hivm.address_space<ub>>) -> ()
               "scf.yield"() : () -> ()
             }, {
             }) : (i1) -> ()
@@ -2505,4 +2508,4 @@ Traceback (most recent call last):
     return self._pp.run(mlir_str)
            ^^^^^^^^^^^^^^^^^^^^^^
 RuntimeError: Pass pipeline run failed
-[ERROR] 2026-05-08-10:07:17 (PID:2094264, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+[ERROR] 2026-05-08-10:55:43 (PID:2271438, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
