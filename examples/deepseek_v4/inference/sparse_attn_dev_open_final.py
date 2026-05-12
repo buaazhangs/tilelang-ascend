@@ -223,7 +223,7 @@ def generate_data():
         seq_len=256,
         seq_len_kv=256,
         top_k=128,
-        dim=512,
+        dim=32,
     )
 
 
