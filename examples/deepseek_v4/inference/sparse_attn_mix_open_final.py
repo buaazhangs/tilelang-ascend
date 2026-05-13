@@ -18,6 +18,10 @@ def sparse_attn_mix_kernel(
     block_heads,
     num_heads,
     dim,
+    batch_size,
+    seq_len,
+    seq_len_kv,
+    top_k,
     multibuffer=2,
     scale=None,
     dtype=BF16,
@@ -29,6 +33,8 @@ def sparse_attn_mix_kernel(
     # - block_heads：沿 Q 的 num_heads 维度的分块大小，例如每次处理 16 个 Q heads。
     # - num_heads：Q 的注意力头数量；本 kernel 的 KV 没有 head 维度，更接近 MQA/shared-KV。
     # - dim：每个 head 的向量维度，也是 Q/K/V 点积的归约维。
+    # - batch_size/seq_len/seq_len_kv/top_k：按 FA_mix 的写法作为编译期静态 shape，
+    #   避免在后续 NPUIR stride-align 前丢失 reinterpret_cast/subview 的静态 stride 信息。
     # - multibuffer：mix pass 扩展 workspace 后的 ping-pong buffer 数量，同时也是 pipeline stage 数。
     # - scale：attention score 的缩放因子，默认 1/sqrt(dim)。
     if scale is None:
@@ -36,12 +42,11 @@ def sparse_attn_mix_kernel(
 
     assert block_heads % 2 == 0, "mix kernel maps one cube block to two vector sub-blocks"
 
-    # 运行期符号维度：
-    # batch_size/seq_len 来自 Q；seq_len_kv 来自 KV；top_k 来自 TopKIndices 最后一维。
-    batch_size = T.symbolic("batchSize")
-    seq_len = T.symbolic("seqLen")
-    seq_len_kv = T.symbolic("seqLenKV")
-    top_k = T.symbolic("topK")
+    shape_q = [batch_size, seq_len, num_heads, dim]
+    shape_kv = [batch_size, seq_len_kv, dim]
+    shape_o = [batch_size, seq_len, num_heads, dim]
+    shape_sink = [num_heads]
+    shape_topk = [batch_size, seq_len, top_k]
 
     # mix 模式下一个 Cube tile 负责 block_heads 个 head，两个 Vector 逻辑核
     # 通过 vid 分别处理前/后 block_heads_half 个 head，形成 CV 1:2 的划分。
@@ -49,11 +54,11 @@ def sparse_attn_mix_kernel(
 
     @T.prim_func
     def sparseAttnMix(
-        Q: T.Tensor((batch_size, seq_len, num_heads, dim), dtype),
-        KV: T.Tensor((batch_size, seq_len_kv, dim), dtype),
-        Output: T.Tensor((batch_size, seq_len, num_heads, dim), dtype),
-        AttnSink: T.Tensor((num_heads,), accum_dtype),
-        TopKIndices: T.Tensor((batch_size, seq_len, top_k), indices_dtype),
+        Q: T.Tensor(shape_q, dtype),
+        KV: T.Tensor(shape_kv, dtype),
+        Output: T.Tensor(shape_o, dtype),
+        AttnSink: T.Tensor(shape_sink, accum_dtype),
+        TopKIndices: T.Tensor(shape_topk, indices_dtype),
     ):
         # 张量语义：
         # - Q[b, s, h, d]：query token s 在 head h 上的向量。
@@ -269,11 +274,19 @@ def sparse_attn(
     # 当前配置下，Cube 每次处理 16 个 Q heads x 32 个 sparse KV tokens，
     # Vector 侧两个 vid 分别处理 8 个 Q heads。
     batch_size, seq_len, num_heads, dim = q.size()
+    seq_len_kv = kv.size(1)
+    top_k = topk_idxs.shape[-1]
+    assert kv.size(0) == batch_size and kv.size(2) == dim
+    assert topk_idxs.size(0) == batch_size and topk_idxs.size(1) == seq_len
+    assert attn_sink.numel() == num_heads
     if (
         not hasattr(sparse_attn, "kernel")
+        or sparse_attn.batch_size != batch_size
+        or sparse_attn.seq_len != seq_len
+        or sparse_attn.seq_len_kv != seq_len_kv
         or sparse_attn.num_heads != num_heads
         or sparse_attn.dim != dim
-        or sparse_attn.top_k != topk_idxs.shape[-1]
+        or sparse_attn.top_k != top_k
     ):
         os.environ["TILELANG_ASCEND_MODE"] = "Expert"
         # Expert/API lowering 才会把 T.alloc_workspace 降成 memref_ext.alloc_workspace，
@@ -283,12 +296,19 @@ def sparse_attn(
             block_heads,
             num_heads,
             dim,
+            batch_size,
+            seq_len,
+            seq_len_kv,
+            top_k,
             multibuffer,
             softmax_scale,
         )
+        sparse_attn.batch_size = batch_size
+        sparse_attn.seq_len = seq_len
+        sparse_attn.seq_len_kv = seq_len_kv
         sparse_attn.num_heads = num_heads
         sparse_attn.dim = dim
-        sparse_attn.top_k = topk_idxs.shape[-1]
+        sparse_attn.top_k = top_k
 
     output = torch.empty((batch_size, seq_len, num_heads, dim), dtype=q.dtype, device=q.device)
     sparse_attn.kernel(q, kv.contiguous(), output, attn_sink, topk_idxs)
