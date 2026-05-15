@@ -37,6 +37,7 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
 
   struct StageGroup {
     hivm::TCoreType coreType = hivm::TCoreType::CUBE_OR_VECTOR;
+    SmallVector<Operation *> localAllocs;
     SmallVector<Operation *> ops;
   };
 
@@ -56,6 +57,7 @@ struct TileLangIRCVSplit : impl::TileLangIRCVSplitBase<TileLangIRCVSplit> {
       SmallVector<StageGroup> orderedGroups =
           collectVectorGroupsByOrder(cubeGroups, cubeGroupOfOp);
 
+      assignLocalAllocsToGroups(orderedGroups);
       packGroups(orderedGroups);
     }
   }
@@ -76,7 +78,9 @@ private:
     return name == "hivm.hir.mmadL1" || name.contains("mmad");
   }
 
-  // 声明和元数据不是实际的 C/V 执行语句，需要留在父 loop 中供多个 scope 捕获。
+  // 声明和元数据不是实际的 C/V 执行语句，先不作为计算 op 参与分组。
+  // 后续 assignLocalAllocsToGroups 会把只属于单个 scope 的普通 alloc 下沉，
+  // 其余跨 scope / multi-buffer alloc 继续留在父 loop 中供多个 scope 捕获。
   // 其中 annotation.mark 只描述 multi_buffer 等属性，若误放入 VECTOR scope，
   // InferMemScope 会把被标记的 local buffer 当作 UB 使用，和真实 CUBE GEMM
   // 的 L1 约束冲突。
@@ -284,6 +288,68 @@ private:
     return orderedGroups;
   }
 
+  // 普通 local alloc 如果所有有效使用都落在同一个 C/V stage 内，就可以下沉到
+  // 该 scope。这样 NPUIR memory planner 能按 scope 生命周期复用 CC/UB。
+  // 带 multi_buffer 标记的 alloc 必须留在外层，后续 EnableLocalBuffer 需要
+  // 在 EnableMultiBuffer 生成的 stage loop 上给它增加 stage 维度。
+  void assignLocalAllocsToGroups(SmallVectorImpl<StageGroup> &groups) {
+    DenseMap<Operation *, std::size_t> groupOfOp;
+    for (std::size_t groupId = 0; groupId < groups.size(); ++groupId) {
+      for (Operation *op : groups[groupId].ops)
+        groupOfOp[op] = groupId;
+    }
+
+    for (auto &op : currentForOp.getBody()->getOperations()) {
+      auto allocOp = dyn_cast<memref::AllocOp>(&op);
+      if (!allocOp || hasAnnotationMark(allocOp) || hasMultiBufferMark(allocOp))
+        continue;
+
+      std::size_t targetGroup = 0;
+      bool hasTarget = false;
+      bool canMove = true;
+
+      for (Operation *user : allocOp.getResult().getUsers()) {
+        Operation *topLevelUser = getTopLevelOpInCurrentFor(user);
+        if (!topLevelUser || topLevelUser == allocOp) {
+          canMove = false;
+          break;
+        }
+
+        auto it = groupOfOp.find(topLevelUser);
+        if (it == groupOfOp.end()) {
+          canMove = false;
+          break;
+        }
+
+        if (!hasTarget) {
+          targetGroup = it->second;
+          hasTarget = true;
+        } else if (targetGroup != it->second) {
+          canMove = false;
+          break;
+        }
+      }
+
+      if (canMove && hasTarget)
+        groups[targetGroup].localAllocs.push_back(allocOp);
+    }
+  }
+
+  bool hasAnnotationMark(memref::AllocOp allocOp) {
+    return llvm::any_of(allocOp.getResult().getUsers(), [](Operation *user) {
+      return isa<annotation::MarkOp>(user);
+    });
+  }
+
+  bool hasMultiBufferMark(memref::AllocOp allocOp) {
+    for (Operation *user : allocOp.getResult().getUsers()) {
+      auto markOp = dyn_cast<annotation::MarkOp>(user);
+      if (markOp && markOp->getAttr("hivm.multi_buffer"))
+        return true;
+    }
+    return false;
+  }
+
   Operation *findNextCubeOpAfter(
       Operation *op, const DenseMap<Operation *, std::size_t> &cubeGroupOfOp) {
     bool seenOp = false;
@@ -346,6 +412,8 @@ private:
                      builder.getAttr<hivm::TCoreTypeAttr>(group.coreType));
 
       auto &scopeBody = scope.getRegion().emplaceBlock();
+      for (auto *alloc : group.localAllocs)
+        alloc->moveBefore(&scopeBody, scopeBody.end());
       for (auto *op : group.ops)
         op->moveBefore(&scopeBody, scopeBody.end());
 
