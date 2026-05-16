@@ -41,6 +41,7 @@ def sparse_attn_mix_kernel(
         scale = (1.0 / dim) ** 0.5
 
     assert block_heads % 2 == 0, "mix kernel maps one cube block to two vector sub-blocks"
+    assert dim % 2 == 0, "mix V1 gather splits KV dim across two vector sub-blocks"
 
     shape_q = [batch_size, seq_len, num_heads, dim]
     shape_kv = [batch_size, seq_len_kv, dim]
@@ -51,6 +52,7 @@ def sparse_attn_mix_kernel(
     # mix 模式下一个 Cube tile 负责 block_heads 个 head，两个 Vector 逻辑核
     # 通过 vid 分别处理前/后 block_heads_half 个 head，形成 CV 1:2 的划分。
     block_heads_half = block_heads // 2
+    dim_half = dim // 2
 
     @T.prim_func
     def sparseAttnMix(
@@ -87,7 +89,7 @@ def sparse_attn_mix_kernel(
             pv_acc = T.alloc_fragment((block_heads, dim), accum_dtype)
 
             # Vector 侧本地 tile：负责 gather 稀疏 KV、mask、online softmax 和输出累加。
-            kv_ub = T.alloc_shared((block_top_k, dim), dtype)
+            kv_ub = T.alloc_shared((block_top_k, dim_half), dtype)
             idxs = T.alloc_fragment((block_top_k,), indices_dtype)
             # mask_ub 由 V1 生成并在 V2 使用，是跨 Vector scope 的 per-stage 临时值；
             # 它不是 scores_max/sum_exp/acc_o 这种跨 k 递推状态，因此需要 local multi-buffer。
@@ -143,6 +145,10 @@ def sparse_attn_mix_kernel(
 
                     # Vector 阶段 1：读取本 query 的 top-k 索引，按索引从 KV
                     # gather 出稀疏 K/V tile；-1 表示无效位置，对应 mask=0。
+                    # KV 没有 head 维，因此 V1 使用 vid 沿 dim 维二分：
+                    # 两个 AIV 分别搬同一批 top-k KV 的前/后半列，写入
+                    # workspace_kv 的不同 dim 区间，避免重复搬完整 KV。
+                    dim_offset = vid * dim_half
                     T.vbrc(value_zero, kv_ub)
                     T.vbrc(value_zero, mask_ub)
                     T.copy(
@@ -154,9 +160,17 @@ def sparse_attn_mix_kernel(
                         cur_idx = idxs[i]
                         if cur_idx != -1:
                             mask_ub[0, i] = 1.0
-                            T.copy(KV[by, cur_idx, 0], kv_ub[i, 0], size=[1, dim])
+                            T.copy(
+                                KV[by, cur_idx, dim_offset],
+                                kv_ub[i, 0],
+                                size=[1, dim_half],
+                            )
 
-                    T.copy(kv_ub, workspace_kv[0,0, 0], size=[block_top_k, dim])
+                    T.copy(
+                        kv_ub,
+                        workspace_kv[0,0, dim_offset],
+                        size=[block_top_k, dim_half],
+                    )
 
                     # Cube 阶段 1：从 workspace 回灌 KV 到 L1，计算
                     # scores = Q * K^T，得到 block_heads x block_top_k 的分数。
