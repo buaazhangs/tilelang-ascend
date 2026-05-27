@@ -102,9 +102,9 @@ private:
     group.ops.push_back(op);
   }
 
-  // copy 的 source/target 可能不是 workspace 本身，而是
-  // workspace 上的 subview/reinterpret_cast/collapse_shape 等 view。
-  // 这些 view producer 和 copy 是同一个 C/V 边界的一部分，必须一起进 scope；
+  // copy 的 source/target 可能不是 workspace/GM 本身，而是它们上面的
+  // subview/reinterpret_cast/collapse_shape 等 view。
+  // 这些 view producer 和 copy 是同一个 C/V 或 GM->Cube 边界的一部分，必须一起进 scope；
   // 否则 copy 被搬入 scope 后会使用仍留在父 region、甚至位于 scope 之后的 view。
   void addViewProducerChainToGroup(StageGroup &group, Value value) {
     llvm::SmallPtrSet<Operation *, 8> visited;
@@ -145,7 +145,23 @@ private:
               });
   }
 
-  Operation *findWorkspaceToLocalCopyBefore(
+  // 寻找当前 GEMM/mmadL1 前面给某个 local alloc 写数据的 copy，并把它作为
+  // Cube scope 的输入搬运一起收进去。
+  //
+  // 当前规则：
+  // 1. workspace -> local：这是 mix 模式里显式的 C/V 边界，必须由 Cube
+  //    scope 回灌到 L1/cbuf 后再参与 GEMM。
+  // 2. GM -> local：这是普通 FA 这类写法里的 K/V 输入搬运。虽然它不是
+  //    workspace 边界，但目的 local alloc 随后作为 GEMM 输入使用，因此也
+  //    应归 Cube scope；否则会被剩余 op 分到 Vector scope，InferMemScope
+  //    会对同一个 local alloc 同时推导出 UB 和 L1。
+  //
+  // source/target 往往不是 workspace 或 GM 原值，而是 subview /
+  // reinterpret_cast / collapse_shape 等 view。判断时会沿 ViewLikeOpInterface
+  // 递归追溯 view source，所以能识别：
+  //   memref.subview %workspace[...] -> local
+  //   memref.subview %reinterpret_cast_gm[...] -> local
+  Operation *findCubeInputCopyBefore(
       Operation *anchor, Operation *localAlloc,
       const llvm::SmallPtrSetImpl<Operation *> &alreadyInCube) {
     Operation *candidate = nullptr;
@@ -158,14 +174,19 @@ private:
       auto copyOp = dyn_cast<CopyOpInterface>(&op);
       if (!copyOp)
         continue;
-      if (isValFromWorkspace(copyOp.getSource()) &&
+      if (isValAtCubeBoundary(copyOp.getSource()) &&
           getLocalAllocRoot(copyOp.getTarget()) == localAlloc)
         candidate = &op;
     }
     return candidate;
   }
 
-  Operation *findLocalToWorkspaceCopyAfter(
+  // 寻找当前 GEMM/mmadL1 后面从某个 local alloc 搬出的 copy，并作为 Cube
+  // scope 的输出搬运一起收进去。当前只收 local -> workspace/GM：
+  // - local -> workspace：写给后续 Vector scope 或下一个 Cube scope 使用；
+  // - local -> GM：直接由 Cube 结果写回全局内存的场景。
+  // 这里同样会通过 view producer 追溯 subview/reinterpret_cast 的真实来源。
+  Operation *findCubeOutputCopyAfter(
       Operation *anchor, Operation *localAlloc,
       const llvm::SmallPtrSetImpl<Operation *> &alreadyInCube) {
     bool seenAnchor = false;
@@ -185,7 +206,7 @@ private:
       if (!copyOp)
         continue;
       if (getLocalAllocRoot(copyOp.getSource()) == localAlloc &&
-          isValFromWorkspace(copyOp.getTarget()))
+          isValAtCubeBoundary(copyOp.getTarget()))
         return &op;
     }
     return nullptr;
@@ -200,11 +221,9 @@ private:
         continue;
 
       addBoundaryCopyToGroup(
-          group, findWorkspaceToLocalCopyBefore(anchor, localAlloc,
-                                                alreadyInCube));
+          group, findCubeInputCopyBefore(anchor, localAlloc, alreadyInCube));
       addBoundaryCopyToGroup(
-          group, findLocalToWorkspaceCopyAfter(anchor, localAlloc,
-                                               alreadyInCube));
+          group, findCubeOutputCopyAfter(anchor, localAlloc, alreadyInCube));
     }
   }
 
@@ -462,6 +481,30 @@ private:
                  return true;
                })
                .Default(false);
+  }
+
+  // 判断一个 value 是否是 GM memref，或来自 GM memref 的 view。FA 这类 kernel
+  // 的 K/V 输入通常是：
+  //   arg(gm) -> reinterpret_cast(gm) -> subview(gm) -> local
+  // 因此不能只看 defining op 是否是 workspace alloc，还要检查 memref 类型上的
+  // #hivm.address_space<gm>，并沿 view source 继续回溯。
+  bool isValFromGM(Value val) {
+    if (auto memrefType = dyn_cast<MemRefType>(val.getType())) {
+      auto addrSpace = hivm::getOptionalHIVMAddressSpace(memrefType);
+      if (addrSpace.has_value() && *addrSpace == hivm::AddressSpace::GM)
+        return true;
+    }
+
+    auto definingOp = val.getDefiningOp();
+    if (auto viewOp = dyn_cast_or_null<ViewLikeOpInterface>(definingOp))
+      return isValFromGM(viewOp.getViewSource());
+    return false;
+  }
+
+  // Cube scope 边界 copy 的外侧来源/去处。workspace 是混编流水的显式跨核
+  // 中转点；GM 是普通输入/输出全局内存。二者的 view 都在各自判断里处理。
+  bool isValAtCubeBoundary(Value val) {
+    return isValFromWorkspace(val) || isValFromGM(val);
   }
 
 };
