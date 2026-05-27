@@ -201,21 +201,25 @@ def sparse_attn_mix_kernel(
                     T.copy(scores_max, scores_max_prev)
                     T.vmul(scores_ub, scale, scores_ub)
                     T.reduce_max(scores_ub, scores_max, dim=1)
-                    for i in T.Parallel(block_heads_half):
-                        scores_scale[i, 0] = T.exp(scores_max_prev[i, 0] - scores_max[i, 0])
                     for i, j in T.Parallel(block_heads_half, block_top_k):
                         scores_ub[i, j] = T.exp(scores_ub[i, j] - scores_max[i, 0])
                     for i, j in T.Parallel(block_heads_half, block_top_k):
                         scores_ub[i, j] *= mask_ub[0, j]
-                    T.reduce_sum(scores_ub, scores_sum, dim=1)
-                    for i in T.Parallel(block_heads_half):
-                        sum_exp[i, 0] = sum_exp[i, 0] * scores_scale[i, 0] + scores_sum[i, 0]
+
+                    # P 是跨到 Cube 阶段 2 的数据，优先 cast 并通过 MTE3 写出。
+                    # 后续 reduce_sum/sum_exp 更新只在 Vector 内部使用，可与 P 的搬出重叠。
                     T.vcast(scores_ub, scores_cast, round_mode="rint")
+                    # T.reduce_sum(scores_ub, scores_sum, dim=1)
                     T.copy(
                         scores_cast,
                         workspace_prob[0,vid * block_heads_half, 0],
                         size=[block_heads_half, block_top_k],
                     )
+                    T.reduce_sum(scores_ub, scores_sum, dim=1)
+                    for i in T.Parallel(block_heads_half):
+                        scores_scale[i, 0] = T.exp(scores_max_prev[i, 0] - scores_max[i, 0])
+                    for i in T.Parallel(block_heads_half):
+                        sum_exp[i, 0] = sum_exp[i, 0] * scores_scale[i, 0] + scores_sum[i, 0]
 
                     # Cube 阶段 2：读取两个 Vector 子块写好的概率，计算
                     # P * V，输出完整 block_heads 的本块贡献到 workspace_out。
@@ -281,13 +285,14 @@ def sparse_attn(
     # - attn_sink: [num_heads]，每个 Q head 一个 sink 标量。
     # - topk_idxs: [batch_size, seq_len, top_k]，每个 query token 对应的稀疏 KV 下标。
     # - softmax_scale: score 缩放因子，通常是 1/sqrt(dim)。
-    block = 32
-    block_heads = 64
+    block = 64
+    # block_heads = 64
     multibuffer = 2
     # block 别名对应 kernel 里的 block_top_k；block_heads 对应 Q num_heads 维分块。
     # 当前配置下，Cube 每次处理 16 个 Q heads x 32 个 sparse KV tokens，
     # Vector 侧两个 vid 分别处理 8 个 Q heads。
     batch_size, seq_len, num_heads, dim = q.size()
+    block_heads = num_heads
     seq_len_kv = kv.size(1)
     top_k = topk_idxs.shape[-1]
     assert kv.size(0) == batch_size and kv.size(2) == dim
@@ -427,7 +432,7 @@ def generate_data():
         seq_len=256,
         seq_len_kv=256,
         top_k=128,
-        dim=32,
+        dim=512,
     )
 
 
